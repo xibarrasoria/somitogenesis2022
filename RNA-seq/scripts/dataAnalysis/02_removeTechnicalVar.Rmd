@@ -1,0 +1,109 @@
+---
+title: "Removal of technical variation from RNA-seq data"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    code_folding: hide
+    toc: true
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(edgeR)
+library(limma)
+library(DESeq2)
+library(RColorBrewer)
+library(ggplot2)
+library(ggpubr)
+library(PCAtools)
+
+dir <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/"
+
+palette(c(brewer.pal(n=8, "Set2"), brewer.pal(n=9, "Set1")))
+```
+
+We have processed and QCed RNA-seq data from mouse somites. All but one sample are of good enough quality for downstream analyses.
+
+```{r data}
+meta <- read.table(paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), stringsAsFactors = FALSE, header = TRUE)
+
+data <- read.table(paste0(dir, "RNA-seq/data/geneCounts.RAW.tsv"), check.names = FALSE)
+dataNorm <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_logCPM.tsv"), check.names = FALSE)
+
+y <- readRDS(paste0(dir, "RNA-seq/results/01_edgeRobject.Rds"))
+```
+
+We observed strong technical effects relating to the date of sample collection. Since the experimental design is partially confounded with collection date, we cannot simply regress it out on the differential expression analysis. Thus, we need to identify and remove these technical variation.
+
+One approach is to use PCA on the residuals after fitting the model including the biological effects of interest, and remove the amount of variation that is above that expected by chance. This will only preserve what is explicitly modelled in the design; in this case, the *stage* and *somite* of each sample. Any other effects, technical *and* biological, will be removed.
+
+We fit a model including the design considering stage and somite, and apply PCA on the residuals of the fit. We then use the `parallelPCA` function from the `PCAtools` package to estimate the number of PCs to keep. This test is based on permuting the data to establish how much variation is explained under a random model; PCs that capture more variation than the random model are kept.
+
+```{r pca, message=FALSE, warning=FALSE}
+## design matrix
+meta$group <- as.factor(meta$group)
+design <- model.matrix(~0+group, meta[meta$QC==1,]) ## only use samples that pass QC
+colnames(design) <- paste0("stage", levels(meta$group))
+
+## fit modoel
+fit <- lmFit(dataNorm[,-1], design)
+## obtain residuals
+res <- residuals(fit, dataNorm[,-1])
+
+## use a permutation test to estimate how many PCs explain more variation than expected by chance
+n.pc <- parallelPCA(dataNorm[,-1])
+
+## compute PCA on the residuals to identify major sources of variation unrelated to design
+pcs <- prcomp(t(res))
+```
+
+For this dataset we retain the first `r n.pc$n` PCs.
+
+Next, we regress out these PCs and run a PCA on the corrected data to check the batch effect. Samples separate by stage and somite better than before and, importantly, there is no segregation by collection date anymore, suggesting this procedure has identified and removed the variation associated wit the experiments' dates successfully.
+
+```{r plotPCA, fig.width=10, fig.height=8}
+## regress out batch effect
+dataNorm.corr <- removeBatchEffect(dataNorm[,-1], design = model.matrix(~0+group, meta[meta$QC==1,]), covariates = pcs$x[,1:n.pc$n])
+
+## variance stablisation to obtain meaningful variable genes for the PCA
+tmp <- data[row.names(dataNorm.corr), colnames(dataNorm.corr)]
+data.vst <- vst(as.matrix(tmp))
+data.vst <- removeBatchEffect(data.vst, design = model.matrix(~0+group, meta[meta$QC==1,]), covariates = pcs$x[,1:n.pc$n])
+
+## select most variable genes
+vars <- rowVars(data.vst)
+names(vars) <- row.names(data.vst)
+pca <- prcomp(t(dataNorm.corr[names(vars[order(vars, decreasing = TRUE)])[1:1000],]))
+
+eigs <- pca$sdev^2
+prop.var <- eigs / sum(eigs)
+# plot(prop.var, ylab="proportion of variance explained", xlab="PC", bty="l")
+
+df <- as.data.frame(pca$x)
+plots <- list()
+plots[[1]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(col=as.factor(meta[meta$QC==1,]$stage))) + labs(col="stage") + ggtitle("stage") + xlab(paste("PC1 - ", round(prop.var[1]*100,2), "% var explained")) + ylab(paste("PC2 - ", round(prop.var[2]*100,2), "% var explained"))
+plots[[2]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(col=as.factor(meta[meta$QC==1,]$somite))) + labs(col="somite") + ggtitle("somite") + xlab(paste("PC1 - ", round(prop.var[1]*100,2), "% var explained")) + ylab(paste("PC2 - ", round(prop.var[2]*100,2), "% var explained"))
+plots[[3]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(col=as.factor(meta[meta$QC==1,]$date))) + labs(col="batch") + ggtitle("collection date") + xlab(paste("PC1 - ", round(prop.var[1]*100,2), "% var explained")) + ylab(paste("PC2 - ", round(prop.var[2]*100,2), "% var explained"))
+ggarrange(plotlist = plots, ncol=2, nrow=2)
+```
+
+We can use these PCs as covariates to regress out when performing differential expression, to ensure that the technical effects are properly controlled for. 
+
+```{r save}
+write.table(pcs$x, paste0(dir, "RNA-seq/results/02_pcs_residuals.tab"), quote = FALSE, sep="\t")
+
+dataNorm.corr <- cbind(gene=dataNorm[,1], as.data.frame(dataNorm.corr))
+write.table(dataNorm.corr, paste0(dir, "RNA-seq/data/geneCounts.NORM_batchCorrected_14PCs.tsv"), quote = FALSE, sep="\t")
+```
+
+
+```{r info}
+sessionInfo()
+```
+

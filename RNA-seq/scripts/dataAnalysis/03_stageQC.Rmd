@@ -1,0 +1,129 @@
+---
+title: "Stage QC"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    code_folding: hide
+    toc: true
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(gplots)
+
+dir <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/"
+
+th <- theme_bw() + theme(axis.text.x = element_text(size=10), axis.title.x = element_text(size=10), axis.text.y = element_text(size=10), axis.title.y = element_text(size=10), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank(), plot.title = element_text(face="bold", hjust = 0.5, size=10))
+```
+
+Hox genes are critical in establishing somite identity. In mouse, there are 13 different genes (1 to 13), each with up to four paralogs (A to D). As such, there is substantial redundancy in their expression patterns and function. Hox genes from each paralogous group are clustered and ordered from 1 to 13. The first Hox genes are expressed the earliest and subsequent genes are expressed later in development. That is, Hox1 genes are the first to be expressed and Hox13 are the last.
+
+Each somite has a specific combination of Hox gene expression, with earlier somites having predominantly expression from early Hox genes, whilst these are downregulated in later somites that instead express later Hox genes. Such combinatorial code gives a specific identity to each somite and determines the type of structures it will develop into, i.e. cervical, thoracic, lumbar, sacral or caudal.
+
+This combinatorial Hox code is therefore directly correlated with somite stage, and we can use it to make sure we have the correct stages reported in the experimental design.
+
+### Data
+
+We have the complete transcriptome of individual mouse somites spanning early (8 somites) to late (35 somites) development. At each stage, we have sequenced the last three somites that were segmented (with somiteI being the most recent, and somiteIII the one segmented two cycles before). 
+
+```{r data}
+# metadata
+meta <- read.table(paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), stringsAsFactors = FALSE, header = TRUE)
+meta.all <- meta
+meta <- meta[meta$QC ==1,] ## use only good-qual samples
+
+# normalised, batch-corrected data
+dataNorm <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_batchCorrected_14PCs.tsv"), check.names = FALSE)
+stopifnot(identical(colnames(dataNorm)[-1], meta$sample))
+
+table(meta$somite, stage=meta$stage)
+```
+
+Given the stages we have sampled we should have a good representation of the Hox code, with expression of most, if not all, Hox genes.
+
+### Hox gene expression
+
+Simply plotting the relative expression of all Hox genes across the samples we see good progression of expression from early to late Hox genes, as development proceeds. Stages are indicated at the top:
+
+- green = cervical (stage8)
+- light blue = thoracic (stag18)
+- blue = thoracic (stage21)
+- dark blue = thoracic (stage25)
+- orange = lumbar (stage27)
+- red = sacral (stage35)
+
+And the paralogous Hox groups are coloured from yellow to orange to brown, from 1 to 13.
+
+```{r hoxGenes, fig.width=5, fig.height=5}
+hox <- dataNorm[grep("^Hox",dataNorm$gene),]
+hox <- hox[grep("s", hox$gene, invert=TRUE),] # remove antisense and non-coding genes
+row.names(hox) <- hox$gene
+hox$gene <- NULL
+
+hox.z <- t(apply(hox, 1, function(x) (x-mean(x))/sd(x) )) # visualise with z-scores
+
+hox.num <- as.numeric(substr(row.names(hox.z), 5,6))
+names(hox.num) <- row.names(hox.z)
+
+cols.hox <- colorRampPalette(colors = c("yellow", "orange", "brown"))(length(unique(hox.num)))[hox.num]
+cols.stage <- as.character(factor(meta$stage, labels = c("darkolivegreen4", "skyblue", "cornflowerblue", "dodgerblue4", "darkorange", "indianred1")))
+
+heatmap.2(as.matrix(hox.z[order(hox.num), order(meta$stage)]), trace="none", col=brewer.pal(n=8, name="Blues"), ColSideColors = cols.stage[order(meta$stage)], RowSideColors = cols.hox[order(hox.num)], Colv = FALSE, dendrogram = "none", labCol = rep("",ncol(hox.z)), Rowv = FALSE, key.title = "", key.xlab = "z-score", key.ylab = "", density.info="none")
+```
+
+Cervical somites express only Hox genes 1-5 and these genes decrease in expression as development proceeds. Thoracic somites express genes 6-9. Lumbar somites switch to express genes 10 and 11. Finally, sacral somites express genes 10 to 13, with 12 and 13 being specific to them.
+
+And given that the expression of the Hox genes is so consistent with stage, a PCA on only these `r nrow(hox)` genes recapitulates the developmental progression of the samples. The first two PCs separate the cervical and sacral somites from the trunk somites, whereas the third PC separates the latest thoracic (stage 25) from the earlier ones (18 and 21).
+
+```{r hox_pca, fig.width=10, fig.height=5}
+pca <- prcomp(t(hox))
+eigs <- pca$sdev^2
+prop.var <- eigs / sum(eigs) * 100
+
+df <- as.data.frame(pca$x)
+plots <- list()
+plots[[1]] <- ggplot(df, aes(PC1, PC2, colour=as.factor(meta$stage), shape=meta$somite)) + geom_point(cex=2) + xlab(paste("PC1 -", round(prop.var[1],2), "%")) + ylab(paste("PC2 -", round(prop.var[2],2), "%")) + labs(colour="stage", shape="somite") + scale_color_manual(values = c("darkolivegreen4", "skyblue", "cornflowerblue", "dodgerblue4", "darkorange", "indianred1")) + th
+plots[[2]] <- ggplot(df, aes(PC1, PC3, colour=as.factor(meta$stage), shape=meta$somite)) + geom_point(cex=2) + xlab(paste("PC1 -", round(prop.var[1],2), "%")) + ylab(paste("PC3 -", round(prop.var[3],2), "%")) + labs(colour="stage", shape="somite") + scale_color_manual(values = c("darkolivegreen4", "skyblue", "cornflowerblue", "dodgerblue4", "darkorange", "indianred1")) + th
+ggarrange(plotlist = plots, ncol = 2, common.legend = TRUE, legend = "right")
+```
+
+Two samples from stage 27 (both from the same embryo) separate substantially from the rest and associate more closely to the stage35 samples. These two show expression of late Hox genes like *Hoxd12* and *Hoxd13* that resemble more the expression of stage35 samples, compared to those from stage27.
+
+```{r outlier27, fig.width=10, fig.height=5}
+plots <- list()
+
+df <- data.frame(expr=as.numeric(dataNorm[dataNorm$gene=="Hoxd12",-1]), stage=as.factor(meta$stage))
+plots[[1]] <- ggplot(df, aes(stage, expr, colour=stage)) + geom_boxplot() + ggtitle("Hoxd12") + th + scale_color_manual(values = c("darkolivegreen4", "skyblue", "cornflowerblue", "dodgerblue4", "darkorange", "indianred1"))
+df <- data.frame(expr=as.numeric(dataNorm[dataNorm$gene=="Hoxd13",-1]), stage=as.factor(meta$stage))
+plots[[2]] <- ggplot(df, aes(stage, expr, colour=stage)) + geom_boxplot() + ggtitle("Hoxd13") + scale_color_manual(values = c("darkolivegreen4", "skyblue", "cornflowerblue", "dodgerblue4", "darkorange", "indianred1")) + th
+
+ggarrange(plotlist = plots, ncol = 2, legend = "none")
+```
+
+This suggests that this embryo might have been misannotated and it is of a more advanced stage than 27 somites, although possibly not as far as 35 somites. Therefore, we remove this embryo from downstream analyses.
+
+```{r remove}
+## retrieve the two stage27 samples with high Hoxd12-13 expression
+idx <- which(colnames(dataNorm) %in% meta[meta$stage==27,]$sample)
+wrongStage <- colnames(dataNorm[,idx])[which(dataNorm[dataNorm$gene=="Hoxd12", idx]>2)]
+stopifnot(identical(wrongStage, colnames(dataNorm[,idx])[which(dataNorm[dataNorm$gene=="Hoxd13", idx]>2)]))
+
+meta.all$wrongStage <- ifelse(meta.all$sample %in% wrongStage, 1, 0)
+write.table(meta.all, paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+```
+
+
+```{r info}
+sessionInfo()
+```
