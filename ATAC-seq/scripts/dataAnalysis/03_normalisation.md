@@ -1,0 +1,410 @@
+---
+title: "Normalisation of ATAC-seq data"
+date: "29 March 2019"
+output:
+  html_document:
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    code_folding: hide
+    toc: true
+    toc_float: 
+      collapsed: false
+---
+
+
+
+We have QCed the ATAC-seq data, retaining 50 of 75 samples.
+
+
+```r
+## metadata
+meta <- read.table(paste0(dir, "ATAC-seq/data/metadata_ATACseq.tsv"), stringsAsFactors = FALSE, header = TRUE)
+meta <- meta[meta$QCpass==1,]
+
+## data
+bam.files <- paste0(meta$sample, ".noDUPs.GQ.bam")
+```
+
+### Defining a peak set
+
+We have called peaks using as input all samples merged together.
+
+
+```r
+peakSet <- read.table(paste0(dir, "ATAC-seq/peaks/allGQsamples_peaks.broadPeak"))
+peakSet <- GRanges(peakSet$V1, IRanges(peakSet$V2, peakSet$V3), fc=peakSet$V7, fdr=peakSet$V9)
+
+# remove peaks in blacklisted regions
+blacklist <- readRDS(paste0(dir, "ATAC-seq/data/mm10-blacklist.v2.Rds"))
+remove <- unique(queryHits(findOverlaps(peakSet, blacklist)))
+peakSet <- peakSet[-remove]
+
+# save fo future use
+saveRDS(peakSet, paste0(dir, "ATAC-seq/results/03_peakSet_full.Rds"))
+```
+
+This resulted in 131743 called peaks, which can be used as a common peak-set for all samples.
+
+We count the number of fragments mapped to these regions in each sample, to get a uniform measure of fraction of reads in peaks (FRiP) for all samples. Before, each sample had its own set of peaks, making their FRiPs non-comparable.
+
+
+```r
+param <- readParam(discard=blacklist, restrict=paste0("chr", c(1:19, "X")), pe="both", dedup=FALSE, BPPARAM=MulticoreParam(workers=12))
+peakCounts <- regionCounts(paste0(dir, "ATAC-seq/data/BWA/", bam.files), peakSet, param = param)
+saveRDS(peakCounts, paste0(dir, "ATAC-seq/results/03_peakCounts_all.Rds"))
+
+meta$readsInPeakSet <- colSums(assay(peakCounts))
+write.table(meta, paste0(dir, "ATAC-seq/data/metadata_ATACseq_GQ.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+```
+
+
+### Normalisation
+
+The first thing we need to do is to normalise the data to remove technical biases and have comparable samples across our conditions of interest. For this, we will use methods implemented in the `csaw` package. 
+
+Besides sequencing depth differences, technical biases include composition and efficiency biases. Composition biases arise when there are significant differences in the number or nature of regions being profiled in different samples; in our case, these biases could arise if certain stages have a significantly different set of peaks compared to others. Efficiency biases instead relate to the efficiency of the reactions producing the data, i.e. the tagmentation of the samples. 
+
+#### Composition biases
+
+Composition biases manifest as systematic differences in the fragment counts across the genome. This is because if a sample has peaks absent in other samples, the allocation of reads to these extra peaks results in a depletion of reads everywhere else.
+
+Thus, to assess if there are any composition biases in our data, we count the number of sequencing fragments mapped across 10kb bins tiling the whole genome. These bins should be large enough to provide stable counts and detect any systematic biases. We assume the majority of the genome is not differentially accessible between samples, and thus should have equivalent counts (after accounting for library size).
+
+
+```r
+background <- windowCounts(paste0(dir, "ATAC-seq/data/BWA/", bam.files), bin=TRUE, width=10000, param=param)
+saveRDS(background, paste0(dir, "ATAC-seq/results/03_backgroundCounts_10kbBins.Rds"))
+```
+
+`csaw` uses `edgeR` TMM method to calculate size factors based on the bin counts. We observe that most size factors are close to 1, which suggests that we do not have significant composition biases in the data.
+
+
+```r
+sf.comp <- normFactors(background, se.out=FALSE)
+summary(sf.comp)
+```
+
+```
+##    Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+##  0.7332  0.9685  1.0291  1.0026  1.0445  1.0800
+```
+
+#### Efficiency biases
+
+Next, we check for efficiency biases instead. Given that we have seen large variation in the FRiP of the different samples, it is likely that the efficiency of the tagmentation, or perhaps the quality of the chromatin, are biasing the data.
+
+To compute efficiency biases we instead focus on the counts of our regions of enrichment (peaks). Again, if the reaction is much more efficient in one sample, it will generate higher enrichment of reads in peaks compared to background, and it will manifest as a systematic increase in the counts.
+
+To test for differential accessibility we will use sliding windows across the genome, to be able to capture shape changes, as well as overall peak abundance changes. Thus, we start by computing the fragment counts on 150bp windows sliding 50bp, across the whole genome. Then, we retain only the windows that overlap peaks.
+
+
+```r
+winCounts <- windowCounts(paste0(dir, "ATAC-seq/data/BWA/", bam.files), width=150, spacing=50, filter=75, param = param)
+saveRDS(winCounts, paste0(dir, "ATAC-seq/results/03_windowCounts_150width_50space_75filter.Rds"))
+
+keep.overlap <- overlapsAny(rowRanges(winCounts), peakSet)
+summary(keep.overlap)
+```
+
+```
+##     Mode    FALSE     TRUE 
+##  logical 30173825  3177316
+```
+
+Since we used all samples to call peaks, we have increased power greatly, allowing calling of very low enrichment regions on a per sample basis. Thus, besides restricting the analysis to windows within peaks, we also need to filter out those that are of too low abundance, since we won't have power to do any differential testing on them.
+
+A cutoff of 4 average counts per window retains a similar number of windows to those that overlap peaks. And the two filters agree quite well.
+
+
+```r
+abundances <- aveLogCPM(asDGEList(winCounts)) ## this are mean abundance corrected for library size
+# plot(density(abundances))
+keep.minCount <- abundances > aveLogCPM(4, lib.size = mean(winCounts$totals))
+# summary(keep.minCount)
+
+table(keep.overlap, keep.minCount)
+```
+
+```
+##             keep.minCount
+## keep.overlap    FALSE     TRUE
+##        FALSE 29296721   877104
+##        TRUE    793721  2383595
+```
+
+So we retain only windows within peaks that also pass the minimum count filter.
+
+
+```r
+keep <- keep.overlap & keep.minCount
+
+filtered.data <- winCounts[keep,]
+```
+
+
+Next, we use this subset of windows to compute size factors with the TMM method. In this case, the size factors differ significantly from 1, supporting the presence of strong efficiency biases that need to be corrected before downstream analyses can proceed.
+
+
+```r
+sf.eff <- normFactors(filtered.data, se.out = FALSE)
+summary(sf.eff)
+```
+
+```
+##    Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+##  0.6047  0.7723  0.9412  1.0490  1.3005  2.2384
+```
+
+```r
+plot(density(sf.comp), xlim=c(0.3,2.5), lty=2, lwd=2, bty="l", main="size factors for technical biases")
+lines(density(sf.eff), lwd=2)
+abline(v=1, lty=3, col="grey")
+legend("topright", legend = c("composition", "efficiency"), lty=c(2,1), lwd=2)
+```
+
+![](03_normalisation_files/figure-html/efficiency-1.png)<!-- -->
+
+#### Assessing technical biases
+
+One way of assessing the technical biases captured by the size factors computed above is via MA plots, which plot the average abundance across samples (A) of each region in the `x-axis` versus the log fold-change between a pair of samples (M) in the `y-axis`. We do this with the 10kb bin counts to have large enough counts to be able to observe systematic biases, normalised for library size.
+
+The majority of the bins, observed as the dark blue concentration of data points, represent background noise and these have low mean abundance levels; shifts in their fold-change evidence composition biases and thus the composition size factors pass through the centre of this cloud (dashed line). Most of the time, the dashed line overlaps the red line at M=0, indicating no bias.
+
+There are much fewer bins with much higher mean abundance that represent true enrichment sites (peaks). In this case, deviation of the fold-changes evidence efficiency biases, and the corresponding size factors (solid line) intersect this much smaller portion of the data cloud.
+
+
+```r
+adj.counts <- cpm(asDGEList(background), log=TRUE)
+
+par(mfrow=c(1, 4), mar=c(5, 4, 2, 1.5))
+for (i in 2:ncol(adj.counts)) {
+  cur.x <- adj.counts[,1]
+  cur.y <- adj.counts[,i]
+  smoothScatter(x=(cur.x+cur.y)/2, y=cur.x-cur.y, xlab="A", ylab="M", main=paste("1 vs", i))
+  abline(h=0, col="red", lwd=2)
+  abline(h=c(log2(sf.comp[1]/sf.comp[i]), log2(sf.eff[1]/sf.eff[i])), lty=c(2,1))
+}
+```
+
+![](03_normalisation_files/figure-html/MAplots-1.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-2.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-3.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-4.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-5.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-6.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-7.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-8.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-9.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-10.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-11.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-12.png)<!-- -->![](03_normalisation_files/figure-html/MAplots-13.png)<!-- -->
+
+Importantly, in many cases we observe that the fold-change of high abundance bins changes concurrently with the change in mean abundance. This implies differences in the technical biases depending on the overall enrichment of the regions being profiled, and thus a single size factor would not correct the effect.
+
+Instead, it is more appropriate to use a *trended normalisation* strategy, where a different scaling factor is computed for each window, depending on its mean abundance. This is achieved using a *loess*-based estimation of the trend. 
+
+
+```r
+## each offset represents the log-transformed scaling factor that needs to be applied to the corresponding entry of the count matrix for its normalization
+filtered.data <- normOffsets(filtered.data, type="loess", se.out=TRUE)
+sf.trended <- assay(filtered.data, "offset")
+
+## save for future use
+saveRDS(filtered.data, file=paste0(dir, "ATAC-seq/results/03_windowCounts_filteredWindows.Rds"))
+saveRDS(sf.trended, paste0(dir, "ATAC-seq/results/03_trendedNorm_sizeFactors.Rds"))
+```
+
+And we can check that the normalisation works by computing MA plots with the corrected data. Now the data is centred around M=0 and no trended effects are present. 
+
+
+```r
+adjc <- log2(assay(filtered.data)+0.5)
+abval <- aveLogCPM(asDGEList(filtered.data))
+o <- order(abval)
+
+re.adjc <- adjc - sf.trended/log(2)
+
+par(mfrow=c(1, 4), mar=c(5, 4, 2, 1.5))
+for(i in 2:ncol(re.adjc)){
+  mval <- re.adjc[,1]-re.adjc[,i]
+  fit <- loessFit(x=abval, y=mval)
+  smoothScatter(abval, mval, ylab="M", xlab="Average logCPM", main=paste("Normalised 1 vs",i))
+  lines(abval[o], fit$fitted[o], col="red")
+}
+```
+
+![](03_normalisation_files/figure-html/MAplotsNorm-1.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-2.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-3.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-4.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-5.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-6.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-7.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-8.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-9.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-10.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-11.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-12.png)<!-- -->![](03_normalisation_files/figure-html/MAplotsNorm-13.png)<!-- -->
+
+#### Assessing successful normalisation
+
+If normalisation has indeed removed technical biases, these should not account for a significant amount of the data's variability, and certainly not more than the variation expected from our variables of interest. To check this we use PCA, based on the 5,000 most variable windows. Ideally, samples would then cluster based on our biological variables of interest. But we can also check whether they are grouping by technical effects.
+
+Below is the PCA plot with points (samples) coloured by their stage or date of collection. We observe a bit of grouping by stage (mainly stage35), and a bit of grouping by batch, but nothing particularly clear.
+
+
+```r
+vars <- rowVars(as.matrix(re.adjc))
+tmp <- re.adjc[order(vars, decreasing=TRUE)[1:5000],]
+pca <- prcomp(t(tmp))
+df <- cbind(pca$x, meta)
+
+plots <- list()
+plots[[1]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=as.factor(df$stage))) + labs(colour="stage")
+plots[[2]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$date)) + labs(colour="date")
+multiplot(plotlist = plots, cols=2)
+```
+
+![](03_normalisation_files/figure-html/PCAnorm-1.png)<!-- -->
+
+
+If we instead colour points by their library size or FRiP, we observe clear correlations.
+
+
+```r
+plots[[1]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$goodQuality)) + scale_color_gradientn(colors=rev(brewer.pal(n=10,"RdYlBu"))) + labs(colour="libSize")
+plots[[2]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$readsInPeakSet/df$goodQuality*100)) + scale_color_gradientn(colors=rev(brewer.pal(n=10,"RdYlBu"))) + labs(colour="FRiP")
+multiplot(plotlist = plots, cols=2)
+```
+
+![](03_normalisation_files/figure-html/PCAnorm2-1.png)<!-- -->
+
+```r
+# cor(df$PC1, df$readsInPeakSet/df$goodQuality*100) # -0.59
+# cor(df$PC1, df$goodQuality) # 0.34
+```
+
+The correlation with FRiP is particularly strong.
+
+
+```r
+plot(df$PC1, df$readsInPeakSet/df$goodQuality*100, xlab="PC1", ylab="FRiP", bty="l", pch=16)
+mtext(side=3, line=-1, text = paste0("Pearson r = ", round(cor(df$PC1, df$readsInPeakSet/df$goodQuality*100),2)), at=-35)
+```
+
+![](03_normalisation_files/figure-html/frip-1.png)<!-- -->
+
+### Removing unwanted technical variation
+
+In order to remove the remaining technical variation in the data after the trended normalisation, we apply the same method used on the RNA-seq data. We apply PCA on the residuals after fitting the model including our biological effects and remove the amount of variation that is above that expected by chance. 
+
+Therefore, we fit a model including the design considering stage and somite, and apply PCA on the residuals of the fit. We then use the `parallelPCA` function from `scran` to estimate the number of PCs to keep.
+
+```r
+## design matrix
+meta$group <- factor(paste(meta$stage, meta$somite, sep="."))
+design <- model.matrix(~0+group, meta)
+colnames(design) <- paste0("stage",levels(meta$group))
+
+## use PCA to identify the variation on the residuals after fitting the design of interest
+fit <- lmFit(re.adjc, design)
+res <- residuals(fit, re.adjc)
+
+# pca
+pcs <- prcomp(t(res))
+write.table(pcs$x, paste0(dir, "ATAC-seq/results/03_pcs_residuals.tab"), quote = FALSE, sep="\t", row.names = FALSE, col.names = FALSE)
+```
+
+Regressing out 18 PCs cleans the data very nicely. Now samples cluster by stage very well.
+
+
+```r
+# plugging 're.adjc' into scran::parallelPCA() returns 18
+norm.counts.corr.pca <- removeBatchEffect(re.adjc, design=design, covariates = pcs$x[,1:18])
+
+vars <- rowVars(norm.counts.corr.pca)
+tmp <- norm.counts.corr.pca[order(vars, decreasing=TRUE)[1:5000],]
+pca <- prcomp(t(tmp))
+df <- cbind(pca$x, meta)
+
+plots <- list()
+
+plots[[1]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=as.factor(df$stage))) + labs(colour="stage")
+plots[[2]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$date)) + labs(colour="date")
+plots[[3]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$goodQuality)) + scale_color_gradientn(colors=rev(brewer.pal(n=10,"RdYlBu"))) + labs(colour="libSize")
+plots[[4]] <- ggplot(df, aes(PC1, PC2)) + geom_point(aes(colour=df$readsInPeakSet/df$goodQuality*100)) + scale_color_gradientn(colors=rev(brewer.pal(n=10,"RdYlBu"))) + labs(colour="FRiP")
+multiplot(plotlist = plots, cols=2)
+```
+
+![](03_normalisation_files/figure-html/PCAcorrectedPca-1.png)<!-- -->
+
+
+### Estimating peak abundance
+
+Finally, we count the number of mapped reads in the new set of peaks we have defined based on the window approach, since that is what we will use for downstream analyses. Any windows that were retained after filtering for mean abundance are merged into regions if they are no more than 150bp apart. We also limit the maximum size of a region to 1.5kb; any larger regions are split. This will be the main difference with the peak calls from MACS2.
+
+```r
+## merge windows into regions if they are within 150bp of each other; limit the maximum region size to 1.5kb
+merged <- mergeWindows(rowRanges(filtered.data), tol=150, max.width = 1500)
+
+## count reads in peaks
+blacklist <- readRDS(paste0(dir, "ATAC-seq/data/mm10-blacklist.v2.Rds"))
+regionCounts <- regionCounts(filtered.data$bam.files, merged$region, param = param)
+
+## trended normalisation
+regionCounts <- normOffsets(regionCounts, type="loess", se.out=TRUE)
+sf.trended <- assay(regionCounts, "offset")
+saveRDS(regionCounts, paste0(dir, "ATAC-seq/results/03_peakCounts_csawMerged.Rds"))
+```
+
+```r
+sessionInfo()
+```
+
+```
+## R version 3.5.1 (2018-07-02)
+## Platform: x86_64-pc-linux-gnu (64-bit)
+## Running under: CentOS Linux 7 (Core)
+## 
+## Matrix products: default
+## BLAS: /datastore/sw/gentoo2/usr/lib64/blas/reference/libblas.so.3.7.0
+## LAPACK: /datastore/sw/gentoo2/usr/lib64/R/lib/libRlapack.so
+## 
+## locale:
+##  [1] LC_CTYPE=en_GB.UTF-8       LC_NUMERIC=C              
+##  [3] LC_TIME=en_GB.UTF-8        LC_COLLATE=en_GB.UTF-8    
+##  [5] LC_MONETARY=en_GB.UTF-8    LC_MESSAGES=en_GB.UTF-8   
+##  [7] LC_PAPER=en_GB.UTF-8       LC_NAME=C                 
+##  [9] LC_ADDRESS=C               LC_TELEPHONE=C            
+## [11] LC_MEASUREMENT=en_GB.UTF-8 LC_IDENTIFICATION=C       
+## 
+## attached base packages:
+##  [1] grid      parallel  stats4    stats     graphics  grDevices utils    
+##  [8] datasets  methods   base     
+## 
+## other attached packages:
+##  [1] sva_3.30.1                  genefilter_1.64.0          
+##  [3] mgcv_1.8-24                 nlme_3.1-137               
+##  [5] ggplot2_3.1.1               RColorBrewer_1.1-2         
+##  [7] edgeR_3.24.3                limma_3.38.3               
+##  [9] csaw_1.16.1                 SummarizedExperiment_1.12.0
+## [11] DelayedArray_0.8.0          BiocParallel_1.16.6        
+## [13] matrixStats_0.54.0          Biobase_2.42.0             
+## [15] GenomicRanges_1.34.0        GenomeInfoDb_1.18.2        
+## [17] IRanges_2.16.0              S4Vectors_0.20.1           
+## [19] BiocGenerics_0.28.0        
+## 
+## loaded via a namespace (and not attached):
+##  [1] httr_1.4.0               bit64_0.9-7             
+##  [3] splines_3.5.1            assertthat_0.2.1        
+##  [5] blob_1.1.1               GenomeInfoDbData_1.2.0  
+##  [7] Rsamtools_1.34.1         yaml_2.2.0              
+##  [9] progress_1.2.0           pillar_1.3.1            
+## [11] RSQLite_2.1.1            lattice_0.20-35         
+## [13] glue_1.3.1               digest_0.6.18           
+## [15] XVector_0.22.0           colorspace_1.4-1        
+## [17] htmltools_0.3.6          Matrix_1.2-14           
+## [19] plyr_1.8.4               XML_3.98-1.15           
+## [21] pkgconfig_2.0.2          biomaRt_2.38.0          
+## [23] zlibbioc_1.28.0          purrr_0.3.2             
+## [25] xtable_1.8-3             scales_1.0.0            
+## [27] tibble_2.1.1             annotate_1.60.1         
+## [29] withr_2.1.2              GenomicFeatures_1.34.8  
+## [31] lazyeval_0.2.2           survival_2.42-6         
+## [33] magrittr_1.5             crayon_1.3.4            
+## [35] memoise_1.1.0            evaluate_0.13           
+## [37] tools_3.5.1              prettyunits_1.0.2       
+## [39] hms_0.4.2                stringr_1.4.0           
+## [41] munsell_0.5.0            locfit_1.5-9.1          
+## [43] AnnotationDbi_1.44.0     Biostrings_2.50.2       
+## [45] compiler_3.5.1           rlang_0.3.4             
+## [47] RCurl_1.95-4.12          labeling_0.3            
+## [49] bitops_1.0-6             rmarkdown_1.12          
+## [51] gtable_0.3.0             DBI_1.0.0               
+## [53] R6_2.4.0                 GenomicAlignments_1.18.1
+## [55] knitr_1.22               dplyr_0.8.0.1           
+## [57] rtracklayer_1.42.2       bit_1.1-14              
+## [59] KernSmooth_2.23-15       stringi_1.4.3           
+## [61] Rcpp_1.0.1               tidyselect_0.2.5        
+## [63] xfun_0.6
+```
