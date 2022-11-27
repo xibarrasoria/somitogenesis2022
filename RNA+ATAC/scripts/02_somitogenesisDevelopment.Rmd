@@ -1,0 +1,1024 @@
+---
+title: "Somitogenesis across development"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    code_folding: hide
+    df_print: paged
+    toc: true
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GenomicRanges)
+library(topGO)
+library(pcaExplorer)
+library(GeneTonic)
+library(DEFormats)
+library(DESeq2)
+library(rGREAT)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(RColorBrewer)
+library(dynamicTreeCut)
+library(ComplexHeatmap)
+library(circlize)
+library(UpSetR)
+library(chromVAR)
+library(SummarizedExperiment)
+library(GeneTonic)
+library(inlmisc)
+
+dir <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/"
+
+`%notin%` <- Negate(`%in%`)
+ht_opt$message = FALSE
+
+th <- theme_bw() + 
+  theme(axis.text.x = element_text(size=10), 
+        axis.title.x = element_text(size=12), 
+        axis.text.y = element_text(size=10), 
+        axis.title.y = element_text(size=12), 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        panel.border = element_blank(), 
+        plot.title = element_text(face="bold", hjust = 0.5, size=12))
+
+cols.stage <- c("darkolivegreen4", "skyblue", "cornflowerblue", 
+                "dodgerblue4", "darkorange", "indianred1")
+names(cols.stage) <- paste0("stage", c(8,18,21,25,27,35))
+cols.somite <- alpha(rep("orchid4",3),c(0.25, 0.5, 0.75))
+names(cols.somite) <- paste0("S", c("I","II","III"))
+```
+
+We have explored the genes and chromatin loci that change as somites mature and prepare to undergo EMT. Now we can turn our attention to the changes that happen at different stages of development.
+
+We have data from six different developmental stages. Although the segmentation process is conserved, the somites generated at different stages will give rise to different structures, depending on their position in the antero-posterior axis.
+
+Thus, we can use these data to explore what genes and regulatory regions are different in somites that will develop into different structures.
+
+```{r data}
+### RNA-seq
+## metadata
+meta.rna <- read.table(paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), 
+                       stringsAsFactors = FALSE, header = TRUE)
+meta.rna <- meta.rna[meta.rna$QC == 1 & meta.rna$wrongStage == 0,]
+
+## expression data
+geneCounts <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_batchCorrected_14PCs.tsv"), 
+                       check.names = FALSE, stringsAsFactors = FALSE)
+geneCounts <- geneCounts[,which(colnames(geneCounts) %in% c("gene", meta.rna$sample)),]
+
+
+### ATAC-seq
+## metadata
+meta.atac <- read.table(paste0(dir, "ATAC-seq/data/metadata_ATACseq_GQ.tsv"), 
+                   stringsAsFactors = FALSE, header = TRUE)
+meta.atac <- meta.atac[meta.atac$QCpass==1,]
+
+## accessibility data
+peakCounts <- readRDS(paste0(dir,
+                         "ATAC-seq/results/04_peakCounts_csawMerged.NORM.batchCorrected_18PCs.Rds"))
+```
+
+
+### Transcriptional changes across development
+
+Differential expression analysis identified over ten thousand genes that change in expression between at least a pair of stages. Most show the same behaviour irrespective of the maturation level of each somite, which is not surprising given that the differences between somite trios were very small and restricted to ~3K genes. There are still a few thousand genes that are identified only when performing the analysis in each somite level independently.
+
+```{r de_genes}
+degs <- read.table(paste0(dir, "RNA-seq/results/04_DEresults_summary_stage.tsv"),
+                   stringsAsFactors = FALSE)
+degs$gene <- geneCounts[match(row.names(degs), row.names(geneCounts)),1]
+degs <- degs[,c(ncol(degs), 1:(ncol(degs)-1))]
+
+c(average = sum(degs$ave), somite_wise = sum(degs$somiteSpecific))
+
+## keep only significant genes but save the universe
+universe <- data.frame(gene_id=row.names(degs), gene_name=degs$gene)
+degs <- degs[rowSums(degs[,-1])>0,]
+```
+
+But, in the original analysis we observed that most of these *somite-specific* changes show consistent patterns across all three somite levels, but reach significance in only one of the tests. Thus, very few truly somite-specific changes are observed.
+
+Now, let's evaluate the expression dynamics of these DE genes. We can roughly split the DE genes into 12 clusters that show different expression dynamics.
+
+```{r cluster_degs, warning=FALSE, message=FALSE, fig.width=6, fig.height=5}
+## count data for DEGs
+data <- geneCounts[row.names(degs),-1]
+## z-score
+data <- 2^data-1
+data <- t(apply(data, 1, function(x) (x-mean(x))/sd(x) ))
+
+## split genes into clusters
+dist <- dist(data)
+hc <- hclust(dist)
+cut <- cutreeDynamic(hc, distM = as.matrix(dist), 
+                     minClusterSize = 500, method = "hybrid", 
+                     deepSplit = 1, verbose = 0)
+
+## order clusters to follow developmental progression
+clusters.degs <- factor(paste0("cluster",cut), levels = paste0("cluster",c(8,2,6,7, 4,5, 3, 11,12,9,1, 10)))
+names(clusters.degs) <- row.names(data)
+table(clusters.degs)
+```
+
+Most of these clusters show highest expression in one of the four types of somites (i.e., cervical, thoracic, lumbar, or sacral).
+
+```{r patterns, fig.width=10, fig.height=7}
+## use loess to model the expression pattern of each gene
+tmp <- 2^geneCounts[row.names(degs),-1]
+stage <- factor(paste0("stage", meta.rna$stage), levels=paste0("stage",c(8,18,21,25,27,35)))
+fits <- apply(tmp, 1, function(x) stats::lowess(x~stage))
+
+curves <- unique(as.data.frame(lapply(fits, '[', 2)))
+colnames(curves) <- row.names(tmp)
+row.names(curves) <- paste0("stage",c(8,18,21,25,27,35))
+curvesStd <- t(apply(t(curves), 1, function(x) x/max(x)))
+
+plots <- list()
+for(c in levels(clusters.degs)){
+  g <- names(clusters.degs[clusters.degs==c])
+  test <- curvesStd[g,]
+  mean <- colMeans(test)
+  std <- apply(test, 2, sd)
+  df.sub <- data.frame(x=1:6, ymin=mean-std, ymax=mean+std)
+  df.sub.avg <- data.frame(x=1:6, y=mean)
+  plots[[c]] <- ggplot() + 
+    geom_line(data = df.sub.avg, aes(x,y), colour="black" , size=1) +
+    geom_ribbon(data = df.sub, aes(x=x, ymin=ymin, ymax=ymax), alpha=0.2, fill="black") +
+    xlab("stage") + ylab("expression") + 
+    ggtitle(paste(c, "-", nrow(test), "genes")) + 
+    ylim(0,1.1) +
+    scale_x_discrete(limits=c("8","18","21","25","27","35")) + 
+    th
+}
+ggarrange(plotlist = plots, ncol = 4, nrow = 3)
+```
+
+Better visualised with a heatmap:
+
+```{r heatmap, warning=FALSE, message=FALSE, fig.width=6, fig.height=5}
+## order columns based on somite number
+m <- meta.rna
+m$somite <- factor(m$somite, levels=c("SIII","SII","SI"))
+stopifnot(identical(colnames(data), m$sample)) # make sure the metadata corresponds with count data matrix
+order <- order(m$stage, m$somite)
+
+## heatmap annotation
+ha  <- HeatmapAnnotation(df = data.frame(stage = paste0("stage", m[order,]$stage), 
+                                         somite = m[order,]$somite), 
+                         col = list(stage = cols.stage, somite = cols.somite))
+
+h.stage <- Heatmap(data[,order], 
+                   cluster_columns = FALSE, 
+                   col=colorRamp2(breaks = c(-4,-2,0,2,3), 
+                                  colors = c("steelblue4","steelblue","white", 
+                                             "indianred3","indianred4")),
+                   name = "z-score", 
+                   show_row_names = FALSE, 
+                   show_column_names = FALSE, 
+                   top_annotation = ha, 
+                   row_split = clusters.degs,
+                   cluster_row_slices = FALSE)
+h.stage <- draw(h.stage)
+
+## save to use later
+data.stage.degs <- data
+saveRDS(data.stage.degs, paste0(dir, "RNA+ATAC/results/02_stage_DEGs_data_for_heatmap.Rds"))
+```
+
+```{r annotate_degs}
+## add cluster identity to DEGs
+degs$cluster <- clusters.degs
+degs$fate <- ifelse(degs$cluster %in% paste0("cluster", c(8,2,6,7)), "cervical",
+                    ifelse(degs$cluster %in% paste0("cluster", c(4,5)), "thoracic",
+                           ifelse(degs$cluster %in% paste0("cluster", c(3,11)), "lumbar", "sacral")))
+degs[degs$cluster=="cluster10",]$fate <- NA
+```
+
+
+#### Overrepresented biological processes {.tabset}
+
+As expected, the set of DE genes is highly enriched for terms associated with developmental processes, including the musculo-skeletal system.
+
+```{r go_all, message=FALSE, warning=FALSE}
+## GO enrichment
+GO.all <- topGOtable(DEgenes = degs$gene,
+                     BGgenes = universe$gene_name,
+                     topGO_method2 = "elim",
+                     ontology = "BP",
+                     geneID = "symbol",
+                     addGeneToTerms = TRUE,
+                     mapping = "org.Mm.eg.db",
+                     topTablerows = 1e3)
+## significant terms
+GO.all[c(2,3,6,8,11,12,17,18,20,27,28,31,34,38,39,42,43,49,71,81,84,87), c(2:5,7)]
+```
+
+We can also perform the analysis for each set of clusters that show highest expression in a given fate.
+
+##### Cervical
+
+There are `r length(which(degs$fate=="cervical"))` genes with highest expression in cervical somites (stage 8): the first four clusters in the heatmap above.
+
+These genes are enriched for broad developmental and metabolic terms, with epithelium development being highly significant.
+
+```{r go_cervical, message=FALSE, warning=FALSE}
+## cervical genes
+GO.cervical <- topGOtable(DEgenes = degs[degs$fate=="cervical",]$gene,
+                     BGgenes = universe$gene_name,
+                     topGO_method2 = "elim",
+                     ontology = "BP",
+                     geneID = "symbol",
+                     addGeneToTerms = TRUE,
+                     mapping = "org.Mm.eg.db",
+                     topTablerows = 1e3)
+## significant terms
+GO.cervical[c(1,11,25,28,30,32,36,40,53,60,79,86,87), c(2:5,7,9)]
+```
+
+We can also compute a dendrogram that captures the similarity between the top 50 enriched terms, to identify groups that represent different gene sets.
+
+```{r cervical_dend, warning=FALSE, message=FALSE, fig.width=7, fig.height=6}
+## GO term relationship
+geneTon <- shake_topGOtableResult(GO.cervical)
+gs_dendro(geneTon,
+          n_gs = 50,
+          gs_dist_type = "kappa", 
+          clust_method = "ward.D2",
+          color_leaves_by = "gs_pvalue",
+          color_branches_by = "clusters",
+          create_plot = TRUE)
+```
+
+
+##### Thoracic
+
+There are `r length(which(degs$fate=="thoracic"))` genes with highest expression in thoracic somites (stages 18, 21, and 25): the next two clusters in the heatmap.
+
+These genes are highly enriched for relevant terms, despite being a much smaller set. We observe many of the terms identified when using the complete set of DE genes. We find many terms related to the development of the musculo-skeletal system and somitogenesis/patterning.
+
+```{r go_thoracic, message=FALSE, warning=FALSE}
+## thoracic genes
+GO.thoracic <- topGOtable(DEgenes = degs[degs$fate=="thoracic",]$gene,
+                     BGgenes = universe$gene_name,
+                     topGO_method2 = "elim",
+                     ontology = "BP",
+                     geneID = "symbol",
+                     addGeneToTerms = TRUE,
+                     mapping = "org.Mm.eg.db",
+                     topTablerows = 1e3)
+## significant terms
+GO.thoracic[c(1,2,5,7,11,12,14,16:18,21,25:27,30,39,45,47,54,57,70,78,79,88,91,99), c(2:5,7,9)]
+# cholesterol biosynthesis is specific to stage 25
+```
+
+
+```{r thoracic_dend, warning=FALSE, message=FALSE, fig.width=7, fig.height=6}
+## GO term relationship
+geneTon <- shake_topGOtableResult(GO.thoracic)
+gs_dendro(geneTon,
+          n_gs = 50,
+          gs_dist_type = "kappa", 
+          clust_method = "ward.D2",
+          color_leaves_by = "gs_pvalue",
+          color_branches_by = "clusters",
+          create_plot = TRUE)
+```
+
+##### Lumbar
+
+There are `r length(which(degs$fate=="lumbar"))` genes with highest expression in lumbar somites (stage 27): the next two clusters in the heatmap.
+
+In this case, terms related to erythrocyte development, angiogenesis and vasculogenesis are prevalent, together with differentiation and cell migration.
+
+```{r go_lumbar, message=FALSE, warning=FALSE}
+## lumbar genes
+GO.lumbar <- topGOtable(DEgenes = degs[degs$fate=="lumbar",]$gene,
+                     BGgenes = universe$gene_name,
+                     topGO_method2 = "elim",
+                     ontology = "BP",
+                     geneID = "symbol",
+                     addGeneToTerms = TRUE,
+                     mapping = "org.Mm.eg.db",
+                     topTablerows = 1e3)
+## significant terms
+GO.lumbar[c(1,4,5,8,21,22,25,29,34,36:38,51,61), c(2:5,7,9)]
+```
+
+```{r lumbar_dend, warning=FALSE, message=FALSE, fig.width=7, fig.height=6}
+## GO term relationship
+geneTon <- shake_topGOtableResult(GO.lumbar)
+gs_dendro(geneTon,
+          n_gs = 50,
+          gs_dist_type = "kappa", 
+          clust_method = "ward.D2",
+          color_leaves_by = "gs_pvalue",
+          color_branches_by = "clusters",
+          create_plot = TRUE)
+```
+
+
+##### Sacral
+
+Finally, there are `r length(which(degs$fate=="sacral"))` genes with highest expression in sacral somites (stage 35): the next three clusters in the heatmap.
+
+We still see an enrichment for angiogenesis and blood vessel development. Immune-related terms are also common.
+
+```{r go_sacral, message=FALSE, warning=FALSE}
+## sacral genes
+GO.sacral <- topGOtable(DEgenes = degs[degs$fate=="sacral",]$gene,
+                     BGgenes = universe$gene_name,
+                     topGO_method2 = "elim",
+                     ontology = "BP",
+                     geneID = "symbol",
+                     addGeneToTerms = TRUE,
+                     mapping = "org.Mm.eg.db",
+                     topTablerows = 1e3)
+## significant terms
+GO.sacral[c(1,4,6,7,14,31,33,45,47,70), c(2:5,7,9)]
+```
+
+```{r sacral_dend, warning=FALSE, message=FALSE, fig.width=7, fig.height=6}
+## GO term relationship
+geneTon <- shake_topGOtableResult(GO.sacral)
+gs_dendro(geneTon,
+          n_gs = 50,
+          gs_dist_type = "kappa", 
+          clust_method = "ward.D2",
+          color_leaves_by = "gs_pvalue",
+          color_branches_by = "clusters",
+          create_plot = TRUE)
+```
+
+### Chromatin remodelling during developmental progression
+
+There are also a large number of chromatin loci that change across development. Once again, most change consistently between the somite trios.
+
+```{r da_regions}
+dars <- read.table(paste0(dir, "ATAC-seq/results/04_DAregions_stages.tsv"), 
+                   stringsAsFactors = FALSE)
+dars$somiteSpecific <- ifelse(rowSums(dars[,6:8])>0, 1, 0)
+c(average = sum(dars$ave), stage_wise = sum(dars$somiteSpecific))
+```
+
+The accessibility dynamics can also be clustered
+
+```{r cluster_dars, warning=FALSE, message=FALSE, fig.width=6, fig.height=5}
+## count data for DARs
+data <- peakCounts[row.names(dars),]
+## convert into z-scores
+data <- 2^data
+data <- t(apply(data, 1, function(x) (x-mean(x))/sd(x) ))
+
+## split genes into clusters
+dist <- dist(data)
+hc <- hclust(dist)
+# data is too large to use dynamic tree cut; cut the tree directly with k=12
+cut.dars <- cutree(hc, k=12)
+  
+## order clusters to follow developmental progression
+clusters.dars <- factor(paste0("cluster",cut.dars), 
+                        levels=paste0("cluster", c(10,3, 1,4,9,2,5,12, 7,6,8, 11)))
+names(clusters.dars) <- row.names(data)
+table(clusters.dars)
+```
+
+and the observed dynamics are more diverse than the observed gene expression. Still, most regions peak at a specific stage, but we observe greater diversity in the thoracic somites, with some regions specific to one of the three stages.
+
+```{r heatmap_dars, warning=FALSE, message=FALSE, fig.width=6, fig.height=5}
+## order columns based on somite number
+m <- meta.atac
+m$somite <- factor(m$somite, levels=c("SIII","SII","SI"))
+stopifnot(identical(colnames(data), m$sample)) # make sure the metadata corresponds with count data matrix
+order <- order(m$stage, m$somite)
+
+## heatmap annotation
+ha  <- HeatmapAnnotation(df = data.frame(stage = paste0("stage", m[order,]$stage), 
+                                         somite = m[order,]$somite), 
+                         col = list(stage = cols.stage, somite = cols.somite))
+
+Heatmap(data[,order], 
+        cluster_columns = FALSE, 
+        col=colorRamp2(breaks = c(-2,0,2,4), 
+                       colors = c("steelblue","white","indianred3","indianred4")),
+        name = "z-score", 
+        show_row_names = FALSE, 
+        show_column_names = FALSE, 
+        top_annotation = ha,
+        row_split = clusters.dars,
+        cluster_row_slices = FALSE)
+```
+
+The regions with highest accessibility in thoracic somites are the most abundant, accounting for over half of all DA regions (54.4%).
+
+```{r annotate_dars}
+## add cluster identity to DARs
+dars$cluster <- clusters.dars
+
+# annotate by vertebral fate
+dars$fate <- ifelse(dars$cluster %in% paste0("cluster", c(10,3)), "cervical",
+                    ifelse(dars$cluster %in% paste0("cluster", c(1,4,9,2,5,12)), "thoracic",
+                           ifelse(dars$cluster %in% paste0("cluster", c(7,6)), "lumbar", "sacral")))
+dars[dars$cluster=="cluster11",]$fate <- NA
+# more fine-grained annotation
+dars$fate.sub <- ifelse(dars$cluster %in% paste0("cluster", c(10,3)), "cervical",
+                    ifelse(dars$cluster == "cluster1", "cervical-thoracic",
+                           ifelse(dars$cluster %in% paste0("cluster", c(4,9,2,5,12)), "thoracic",
+                                  ifelse(dars$cluster == "cluster7", "lumbar", 
+                                         ifelse(dars$cluster == "cluster6", "lumbar-sacral", "sacral")))))
+dars[dars$cluster=="cluster11",]$fate.sub <- NA
+table(dars$fate.sub)[c(1,2,6,3:5)]
+```
+
+In terms of the location of these DA regions in the genome, they are slightly depleted of promoters, with a corresponding increase in distal and intergenic regions. But the difference is not as striking as observed between the somite trios. However, if we split by their accessibility profile, regions open in thoracic somites show a much more pronounced depletion of promoters and increase of distal elements; whereas regions preferentially open in lumbar somites are enriched in promoter elements.
+
+```{r genomic_context, fig.width=5, fig.height=4}
+## annotation of regions based on genomic context
+peakAnn <- read.table(paste0(dir, "ATAC-seq/results/05_peaks_classAnnotation.tsv"), sep="\t")
+dars.ann <- peakAnn[substr(row.names(dars), 4, 30),]
+stopifnot(identical(row.names(dars), paste0("chr", row.names(dars.ann))))
+dars.ann$cluster <- dars$cluster
+dars.ann$fate <- dars$fate
+dars.ann$fate.sub <- dars$fate.sub
+
+df <- data.frame(all = round(colSums(peakAnn[,7:11])/nrow(peakAnn)*100, 2),
+                 DA = round(colSums(dars.ann[,7:11])/nrow(dars.ann)*100, 2),
+                 cervical = colSums(dars.ann[which(dars.ann$fate=="cervical"),7:11])/
+                   length(which(dars.ann$fate=="cervical"))*100,
+                 thoracic = colSums(dars.ann[which(dars.ann$fate=="thoracic"),7:11])/
+                   length(which(dars.ann$fate=="thoracic"))*100,
+                 lumbar = colSums(dars.ann[which(dars.ann$fate=="lumbar"),7:11])/
+                   length(which(dars.ann$fate=="lumbar"))*100,
+                 sacral = colSums(dars.ann[which(dars.ann$fate=="sacral"),7:11])/
+                   length(which(dars.ann$fate=="sacral"))*100)
+df <- data.frame(class=rep(row.names(df),6),
+                 DA = c(rep(FALSE, 5), rep(TRUE, 25)),
+                 context = c(rep(c("all", "DA", "cervical", "thoracic", "lumbar", "sacral"), each=5)),
+                 prop = c(df$all, df$DA, df$cervical, df$thoracic, df$lumbar, df$sacral))
+df$context <- factor(df$context, levels=c("all", "DA", "cervical", "thoracic", "lumbar", "sacral"))
+
+ggplot(df, aes(context, prop, fill=class)) + 
+  geom_bar(stat="identity") +
+  scale_fill_manual(values = brewer.pal(n=5, "Spectral")) +
+  ylab("proportion of all peaks") +
+  th
+```
+
+In contrast with the observations with the somite trios, a large number of DA regions directly overlap DE genes: 12824 peaks (38.85%) overlap 4693 genes (43.89%).
+
+```{r overlap}
+## find overlaps between DA peaks and DE genes
+da <- GRanges(seqnames = dars$seqnames, 
+              ranges = IRanges(dars$start, dars$end),
+              cluster = dars$cluster,
+              fate = dars$fate,
+              fate.sub = dars$fate.sub)
+gene_ann <- read.table(paste0(dir, "RNA-seq/data/Mus_musculus.GRCm38.96.ann"), row.names = 1)
+de <- gene_ann[row.names(degs),]
+de$fate <- degs[row.names(de),]$fate
+de <- GRanges(seqnames = paste0("chr", de$V3),
+              ranges = IRanges(de$V4, de$V5),
+              strand = de$V6,
+              gene = de$V2,
+              fate = de$fate)
+# length(unique(subjectHits(findOverlaps(de, da))))/nrow(dars)
+# 12824 (38.85%)
+# length(unique(queryHits(findOverlaps(de, da))))/nrow(degs)
+# 4693 (43.89%)
+```
+
+
+#### Overrepresented biological processes {.tabset}
+
+GREAT analysis takes the genes in the proximity of the DA regions, which are putatively regulated by these peaks, and performs enrichment analysis. 56% of the DE genes lie in close proximity to the set of DA regions. Thus, the enriched GO terms are similar to those observed based on the DE gene analysis. 
+
+```{r great, message=FALSE}
+## background is all open chromatin regions
+background <- GRanges(seqnames = paste0("chr", peakAnn$seqnames),
+                      ranges = IRanges(peakAnn$start, peakAnn$end))
+
+## run GREAT
+job = submitGreatJob(gr = da,
+                     bg = background,
+                     species = "mm10")
+
+# retrieve which genes are associated with each peak
+great.peak_geneAnn <- plotRegionGeneAssociationGraphs(job, plot=FALSE)
+# length(intersect(degs$gene, unique(great.peak_geneAnn$gene)))
+# 6023 (56.34%)  # DE genes that are the 'closest' gene to a DA peak
+
+## enrichment results
+go.dars <- getEnrichmentTables(job, ontology = "GO Biological Process")
+pheno.dars <- getEnrichmentTables(job, category = "Phenotype")
+
+## GO biological process
+go.dars[[1]][c(1,6,7,13:15,40,59), c(2,6,11:9,13)]
+```
+
+As observed with the somite trios, many of the significant terms using DE genes are also found when using the DA regions, and these terms tend to have much lower p-values compared to those that are only identified with DE genes.
+
+```{r compere_degs, warning=FALSE, fig.width=4, fig.height=4}
+GO.all$p.value_great <- go.dars[[1]][match(GO.all$GO.ID, go.dars[[1]]$ID),]$Hyper_Raw_PValue
+GO.all$sig_great <- GO.all$p.value_great<0.05
+
+ggplot(GO.all[!is.na(GO.all$p.value_great),], aes(sig_great, p.value_classic, colour=sig_great)) +
+  geom_boxplot() +
+  scale_color_manual(values=c('TRUE'="red", 'FALSE'="black")) +
+  xlab("term is significant with GREAT") +
+  ylab("p-value of enrichment with DE genes") +
+  th + theme(legend.position = "none")
+```
+
+However, we can also look at enrichment of mouse phenotype data based on single KO mice. Most of the highly significant enriched phenotypes relate to skeleton abnormalities, validating that we are picking up relevant regions. There is also a very strong enrichment for embryonic-lethal genes, which is expected for important developmental regulators.
+
+```{r great_ko, message=FALSE}
+## mouse phenotype
+pheno.dars[['Mouse Phenotype Single KO']][c(1:3,10,11:20,33), c(1,2,6,11:9,13)]
+```
+
+We can repeat this analysis using only the regions with preferential accessibility in somites from one fate.
+
+##### Cervical
+
+The `r sum(grepl("cervical", da$fate.sub))` regions with higher accessibility in **cervical** somites again show similar terms for those with highest enrichments: 
+
+```{r great.cervical, message=FALSE}
+## run GREAT
+job.cervical = submitGreatJob(gr = da[grepl("cervical", da$fate.sub)],
+                              bg = background,
+                              species = "mm10")
+## enrichment results
+go.dars.cervical <- getEnrichmentTables(job.cervical, ontology = "GO Biological Process")
+pheno.dars.cervical <- getEnrichmentTables(job.cervical, category = "Phenotype")
+
+## GO biological process
+go.dars.cervical[[1]][c(1,2,7,16,32,66,67,77,99), c(1,2,6,11:9,13)]
+```
+
+And when looking at the effect of KOs, these regions are still enriched for phenotypes related to skeleton abnormalities, including some specific to cervical vertebrae.
+
+```{r great.cervical_ko, message=FALSE}
+## mouse phenotype
+pheno.dars.cervical[['Mouse Phenotype Single KO']][c(19,20,24,30,51,69,77,90,102,109,112), c(1,2,6,11:9,13)]
+```
+
+##### Thoracic
+
+The `r sum(grepl("thoracic", da$fate.sub))` regions with higher accessibility in **thoracic** somites show a similar behaviour, recapitulating the results from DE genes. 
+
+```{r great.thoracic, message=FALSE}
+## run GREAT
+job.thoracic = submitGreatJob(gr = da[grepl("thoracic", da$fate.sub)],
+                              bg = background,
+                              species = "mm10")
+## enrichment results
+go.dars.thoracic <- getEnrichmentTables(job.thoracic, ontology = "GO Biological Process")
+pheno.dars.thoracic <- getEnrichmentTables(job.thoracic, category = "Phenotype")
+
+## GO biological process
+go.dars.thoracic[[1]][c(8,13,16:21,27,50:53,58:61,65,85,89:90), c(1,2,6,11:9,13)]
+```
+
+And similar KO phenotypes, although with some related to more specific derivatives, such as myotome or cartilage. This perhaps reflects the higher statistical power that comes with such a large number of regions.
+
+```{r great.thoracic_ko, message=FALSE}
+## mouse phenotype
+pheno.dars.thoracic[['Mouse Phenotype Single KO']][c(2,13,14,24,29,39,41,48,56,75,88,95,109,123,124), c(1,2,6,11:9,13)]
+```
+
+##### Lumbar
+
+The `r sum(grepl("lumbar", da$fate.sub))` regions with higher accessibility in **lumbar** somites show less significant enrichments, but the most prominent relate to angiogenesis and differentiation of derivatives, in agreement with the DE results.
+
+```{r great.lumbar, message=FALSE}
+## run GREAT
+job.lumbar = submitGreatJob(gr = da[grepl("lumbar", da$fate.sub)],
+                              bg = background,
+                              species = "mm10")
+## enrichment results
+go.dars.lumbar <- getEnrichmentTables(job.lumbar, ontology = "GO Biological Process")
+pheno.dars.lumbar <- getEnrichmentTables(job.lumbar, category = "Phenotype")
+
+## GO biological process
+go.dars.lumbar[[1]][c(2,6,15,17,33,34,45,51,65,75), c(1,2,6,11:9,13)]
+```
+
+Interestingly, the KO phenotypes are not as clearly enriched for skeleton related phenotypes as with the other sets of DA regions. Instead, the strongest enrichments relate to erythrocytes, again consistent with the results from the DE genes.
+
+```{r great.lumbar_ko, message=FALSE}
+## mouse phenotype
+pheno.dars.lumbar[['Mouse Phenotype Single KO']][c(4,7:10,12,15,17,23,26:30,50,52,57,59), c(1,2,6,11:9,13)]
+```
+
+##### Sacral
+
+The `r sum(grepl("sacral", da$fate.sub))` regions with higher accessibility in **sacral** somites are very strongly enriched for processes related to the skeletal system and differentiation of its components.
+
+```{r great.sacral, message=FALSE}
+## run GREAT
+job.sacral = submitGreatJob(gr = da[grepl("sacral", da$fate.sub)],
+                              bg = background,
+                              species = "mm10")
+## enrichment results
+go.dars.sacral <- getEnrichmentTables(job.sacral, ontology = "GO Biological Process")
+pheno.dars.sacral <- getEnrichmentTables(job.sacral, category = "Phenotype")
+
+## GO biological process
+go.dars.sacral[[1]][c(1,2,5:8,12,16,26,31,33,38,40,61,72,74,81,82,84,89,108,113,119,120), c(1,2,6,11:9,13)]
+```
+
+Similarly strong enrichments for a variety of skeletal phenotypes are observed with gene KOs.
+
+```{r great.sacral_ko, message=FALSE}
+## mouse phenotype
+pheno.dars.sacral[['Mouse Phenotype Single KO']][c(1,2,10,12,13,19,26,30,37,40,44,46,48,49,55,59,64,66,68,70,71,74,75,77,81,85,90,93,95), c(1,2,6,11:9,13)]
+```
+
+####
+
+---
+
+We can next check the enrichment results for phenotypes specific to each type of vertebrae. We observe, for example, that *cervical vertebral transformation* phenotypes show a clear enrichment in the regions most accessible in the cervical somites, but not with any of the other three groups of DA loci. Similar results are obtained with each fate except lumbar regions: the enrichment is significant with the corresponding somites, and often not with regions that peak at other fates. As observed above, lumbar regions do not show enrichment for skeletal phenotypes.
+
+```{r enriched_by_fate, fig.width=12, fig.height=5}
+getPvals <- function(id=NULL){
+c(all = pheno.dars[["Mouse Phenotype Single KO"]][
+  pheno.dars[["Mouse Phenotype Single KO"]]$name == id,]$Hyper_Adjp_BH,
+  cervical = pheno.dars.cervical[["Mouse Phenotype Single KO"]][
+  pheno.dars.cervical[["Mouse Phenotype Single KO"]]$name == id,]$Hyper_Adjp_BH,
+  thoracic = pheno.dars.thoracic[["Mouse Phenotype Single KO"]][
+  pheno.dars.thoracic[["Mouse Phenotype Single KO"]]$name == id,]$Hyper_Adjp_BH,
+  lumbar = pheno.dars.lumbar[["Mouse Phenotype Single KO"]][
+  pheno.dars.lumbar[["Mouse Phenotype Single KO"]]$name == id,]$Hyper_Adjp_BH,
+  sacral = pheno.dars.sacral[["Mouse Phenotype Single KO"]][
+  pheno.dars.sacral[["Mouse Phenotype Single KO"]]$name == id,]$Hyper_Adjp_BH)
+}
+
+tmp <- rbind("abnormal cervical vertebrae morphology" = getPvals(id = "abnormal cervical vertebrae morphology"),
+             "cervical vertebral fusion" = getPvals(id = "cervical vertebral fusion"),
+             "cervical vertebral transformation" = getPvals(id = "cervical vertebral transformation"),
+
+             "thoracic vertebral transformation" = getPvals(id = "thoracic vertebral transformation"),
+             "abnormal thoracic cage morphology" = getPvals(id = "abnormal thoracic cage morphology"),
+             "abnormal thoracic vertebrae morphology" = getPvals(id = "abnormal thoracic vertebrae morphology"),
+             "abnormal thoracic cavity morphology" = getPvals(id = "abnormal thoracic cavity morphology"),
+             "thoracic vertebral fusion" = getPvals(id = "thoracic vertebral fusion"),
+             
+             "abnormal rib joint" = getPvals(id = "abnormal rib joint"),
+             "abnormal rib morphology" = getPvals(id = "abnormal rib morphology"),
+             "abnormal rib development" = getPvals(id = "abnormal rib development"),
+             "rib fusion" = getPvals(id = "rib fusion"),
+             "increased rib number" = getPvals(id = "increased rib number"),
+             "decreased rib number" = getPvals(id = "decreased rib number"),
+             
+             "abnormal lumbar vertebrae morphology" = getPvals(id = "abnormal lumbar vertebrae morphology"),
+             "increased lumbar vertebrae number" = getPvals(id = "increased lumbar vertebrae number"),
+             "decreased lumbar vertebrae number" = getPvals(id = "decreased lumbar vertebrae number"),
+             "lumbar vertebral transformation" = getPvals(id = "lumbar vertebral transformation"),
+             "lumbar vertebral fusion" = getPvals(id = "lumbar vertebral fusion"),
+             
+             "abnormal presacral vertebrae morphology" = getPvals(id = "abnormal presacral vertebrae morphology"),
+             "decreased presacral vertebrae number" = getPvals(id = "decreased presacral vertebrae number"),
+             "increased presacral vertebrae number" = getPvals(id = "increased presacral vertebrae number"),
+             
+             "abnormal sacral vertebrae morphology" = getPvals(id = "abnormal sacral vertebrae morphology"),
+             "sacral vertebral fusion" = getPvals(id = "sacral vertebral fusion"),
+             "increased sacral vertebrae number" = getPvals(id = "increased sacral vertebrae number"),
+             "absent sacral vertebrae" = getPvals(id = "absent sacral vertebrae"),
+             "sacral vertebral transformation" = getPvals(id = "sacral vertebral transformation"),
+             "small sacral vertebrae" = getPvals(id = "small sacral vertebrae"))
+
+h1 <- Heatmap(t(-log10(tmp[3:1,-1])), 
+        col = colorRamp2(breaks = c(0,6),
+                         colors = c("white","darkolivegreen4")),
+        name = "-log10(FDR)",
+        cluster_columns = FALSE, cluster_rows = FALSE)
+
+h2 <- Heatmap(t(-log10(tmp[c(9:11,5,4,6),-1])), 
+        col = colorRamp2(breaks = c(0,15),
+                         colors = c("white","cornflowerblue")),
+        name = "-log10(FDR)",
+        cluster_columns = FALSE, cluster_rows = FALSE)
+
+h3 <- Heatmap(t(-log10(tmp[c(16,15,18,17),-1])), 
+        col = colorRamp2(breaks = c(0,15),
+                         colors = c("white","darkorange")),
+        name = "-log10(FDR)",
+        cluster_columns = FALSE, cluster_rows = FALSE)
+
+h4 <- Heatmap(t(-log10(tmp[c(27,24,23),-1])),
+        col = colorRamp2(breaks = c(0,15),
+                         colors = c("white","indianred1")),
+        name = "-log10(FDR)",
+        cluster_columns = FALSE, cluster_rows = FALSE)
+
+## plot side by side
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(nr = 1, nc = 4)))
+pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 1))
+draw(h1, newpage = FALSE)
+upViewport()
+pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 2))
+draw(h2, newpage = FALSE)
+upViewport()
+pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 3))
+draw(h3, newpage = FALSE)
+upViewport()
+pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 4))
+draw(h4, newpage = FALSE)
+upViewport()
+
+## key terms
+# Heatmap(-log10(tmp[c(1, 5,10, 15, 23),-1]),
+#         col = brewer.pal(n=8, "Blues"),
+#         name = "-log10(FDR)",
+#         cluster_columns = FALSE, cluster_rows = FALSE)
+```
+
+These results demonstrate that the regions we have classified as preferentially open in one particular vertebral fate contain regulatory elements close to genes that, when knocked out, result in phenotypes affecting such vertebrae. 
+
+
+#### Motif enrichment analysis
+
+To understand which transcription factors are mediating some of the changes in expression, we search for overrepresentd binding motifs between the DA regions and an equivalent set of static open chromatin loci.
+
+```{r get_fasta, eval=FALSE}
+## retrieve the FASTA sequences of the DA regions
+# all DA
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   substr(row.names(dars), 4, 50), " >> ", dir,
+                   "RNA+ATAC/results/02_DAregions_stage.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_DAregions_stage.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+## similar set of nonDA to use as a control instead of shuffled seqs
+remove <- which(row.names(peakAnn) %in% substr(row.names(dars),4,50))
+peaks_nonDA <- peakAnn[-remove,1:3]
+peaks_nonDA <- GRanges(peaks_nonDA$seqnames, IRanges(peaks_nonDA$start, peaks_nonDA$end),
+                       name=row.names(peaks_nonDA))
+## should have the same length distribution
+l <- dars$end-dars$start+1 ## DA regions lengths
+freqs <- table(cut(l,6)) ## define 10 intervals and count number of seqs in each
+intervals <- gsub("[(](.+),(.+)[]]","\\1-\\2",names(freqs))
+
+## randomly sample nonDA regions from all peaks that have the same length distribution
+sel <- c()
+for(i in 1:length(intervals)){
+  limits <- as.numeric(unlist(strsplit(intervals[i], "-")))
+  sel <- c(sel, sample(peaks_nonDA[width(peaks_nonDA) > limits[1] & width(peaks_nonDA) <= limits[2],],
+                       freqs[i]))
+}
+control <- do.call('c', sel)
+# plot(density(l))
+# lines(density(width(control)), col="red")
+
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   control$name, " >> ", dir,
+                   "RNA+ATAC/results/02_nonDA_controlRegions_stage.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_nonDA_controlRegions_stage.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+## submit to AME (http://meme-suite.org/tools/ame) to identify enriched TF motifs
+## ran against the human and mouse HOCOMOCOv11_full motif databases
+## all other parameters default
+## downloaded results and saved in dir/RNA+ATAC/results/02_AME_DAregions_stage.tsv
+
+## do the same for each fate
+# cervical
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   substr(row.names(dars[which(dars$fate=="cervical"),]), 4, 50), " >> ", dir,
+                   "RNA+ATAC/results/02_DAregions_stage_cervical.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_DAregions_stage_cervical.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+# thoracic
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   substr(row.names(dars[which(dars$fate=="thoracic"),]), 4, 50), " >> ", dir,
+                   "RNA+ATAC/results/02_DAregions_stage_thoracic.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_DAregions_stage_thoracic.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+# lumbar
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   substr(row.names(dars[which(dars$fate=="lumbar"),]), 4, 50), " >> ", dir,
+                   "RNA+ATAC/results/02_DAregions_stage_lumbar.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_DAregions_stage_lumbar.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+## regions tend to be larger, so the background might not be perfectly matched but it looks close enough
+# sacral
+write.table(paste0("samtools faidx ", dir, "REFERENCE/Mus_musculus.GRCm38.dna.primary_assembly.fa ",
+                   substr(row.names(dars[which(dars$fate=="sacral"),]), 4, 50), " >> ", dir,
+                   "RNA+ATAC/results/02_DAregions_stage_sacral.fasta"), 
+            paste0(dir, "RNA+ATAC/scripts/dataProcessing/02_getDNAseq_DAregions_stage_sacral.sh"), 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+## length distribution for all others is well matched with controls
+```
+
+First, we compute the enrichment for all `r nrow(dars)` DA regions, irrespective of their accessibility patterns. Not surprisingly, a large number of TFs are significantly overrepresented.
+
+```{r motif_enrichment_all}
+## motif annotation downloaded from http://hocomoco11.autosome.ru/downloads_v11
+motif_ann <- read.table(paste0(dir, "REFERENCE/HOCOMOCOv11_full_annotation_MOUSE_mono.tsv"), 
+                        sep="\t", header = TRUE, stringsAsFactors = FALSE)
+tmp <- read.table(paste0(dir, "REFERENCE/HOCOMOCOv11_full_annotation_HUMAN_mono.tsv"), 
+                  sep="\t", header = TRUE, stringsAsFactors = FALSE)
+colnames(tmp) <- colnames(motif_ann)
+## for human TFs, transform gene name to lower case to match mouse gene names (won't work for all, but good enough approximation)
+tmp$Transcription.factor <- paste0(substr(tmp$Transcription.factor, 1, 1), 
+                                   tolower(substr(tmp$Transcription.factor, 2, 10)))
+motif_ann <- rbind(motif_ann, tmp)
+
+## significantly enriched motifs in DA vs nonDA sequences
+motifs_da <- read.table(paste0(dir, "RNA+ATAC/results/02_AME_DAregions_stage.tsv"),
+                        sep = "\t", header = TRUE, stringsAsFactors = FALSE)[,-c(2,4)]
+
+## remove TFs that are not expressed
+not_expr <- which(motif_ann[motif_ann$Model %in% motifs_da$motif_ID,]$Transcription.factor %notin% geneCounts$gene)
+not_expr <- motif_ann[motif_ann$Model %in% motifs_da$motif_ID,][not_expr,]$Model
+
+motifs_da <- motifs_da[motifs_da$motif_ID %notin% not_expr,]
+
+## annotate TF gene
+motifs_da$TF <- motif_ann[match(motifs_da$motif_ID, motif_ann$Model),]$Transcription.factor
+motifs_da$family <- motif_ann[match(motifs_da$motif_ID, motif_ann$Model),]$TF.family
+motifs_da$subfamily <- motif_ann[match(motifs_da$motif_ID, motif_ann$Model),]$TF.subfamily
+
+length(unique(motifs_da$TF)) # 268
+# table(motifs_da$subfamily)
+```
+
+Many of the enriched TFs are similar to those observed with the DA regions across somite trios; strong representation of homeodomain, forkhead, Sox-related, and nuclear receptor families, among many others.
+
+```{r motifs_enriched, warning=FALSE, fig.width=10, fig.height=5}
+motifs_da$label <- ifelse(motifs_da$rank < 35, motifs_da$TF, "")
+ggplot(motifs_da, aes(log2(X.TP/X.FP), -log10(adj_p.value), label=label)) + 
+  geom_point() + 
+  xlab("log2 fold-change (DA / nonDA)") +
+  ylab("-log10(adj p-value)") +
+  geom_text_repel(size = 3, max.overlaps = 200) +
+  th
+```
+
+However, we can also perform the enrichment analysis for regions with preferential accessibility in one fate, to pinpoint any changes in motif usage.
+
+```{r motif_enrichment_each, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+read_AME <- function(file=NULL){
+  motifs <- read.table(file, sep = "\t", header = TRUE, stringsAsFactors = FALSE)[,-c(2,4)]
+  # remove non-expressed TFs
+  motifs <- motifs[motifs$motif_ID %notin% not_expr,]
+  # annotate TFs
+  motifs$TF <- motif_ann[match(motifs$motif_ID, motif_ann$Model),]$Transcription.factor
+  # a few motifs are missing from the annotation - add
+  if(sum(grepl("EVX2_MOUSE.H11MO.0.A", motifs$motif_ID))>0){ motifs[motifs$motif_ID == "EVX2_MOUSE.H11MO.0.A",]$TF <- "Evx2" }
+  if(sum(grepl("EVX1_MOUSE.H11MO.0.C", motifs$motif_ID))>0){ motifs[motifs$motif_ID == "EVX1_MOUSE.H11MO.0.C",]$TF <- "Evx1" }
+  if(sum(grepl("CDX4_MOUSE.H11MO.0.A", motifs$motif_ID))>0){ motifs[motifs$motif_ID == "CDX4_MOUSE.H11MO.0.A",]$TF <- "Cdx4" }
+  
+  motifs$family <- motif_ann[match(motifs$motif_ID, motif_ann$Model),]$TF.family
+  motifs$subfamily <- motif_ann[match(motifs$motif_ID, motif_ann$Model),]$TF.subfamily
+  ## label top hits
+  motifs$label <- ifelse(motifs$rank < 25, motifs_da$TF, "")
+  return(motifs)
+}
+
+# cervical
+motifs_da.cervical <- read_AME(file = paste0(dir, "RNA+ATAC/results/02_AME_DAregions_stage_cervical.tsv"))
+# thoracic
+motifs_da.thoracic <- read_AME(file = paste0(dir, "RNA+ATAC/results/02_AME_DAregions_stage_thoracic.tsv"))
+# lumbar
+motifs_da.lumbar <- read_AME(file = paste0(dir, "RNA+ATAC/results/02_AME_DAregions_stage_lumbar.tsv"))
+# sacral
+motifs_da.sacral <- read_AME(file = paste0(dir, "RNA+ATAC/results/02_AME_DAregions_stage_sacral.tsv"))
+
+```
+
+The regions with highest accessibility in the lumbar somites show **very** different enrichments to all the rest, with over two thirds of the significant TFs not identified with the other sets of DA regions. A large number of TFs are shared by the other three fates. The cervical and thoracic somites share many motifs, but thoracic regions also have many unique enrichments.
+
+```{r motif_each_upset, message=FALSE, warning=FALSE}
+all <- unique(c(motifs_da$motif_ID, motifs_da.cervical$motif_ID, motifs_da.thoracic$motif_ID,
+                motifs_da.lumbar$motif_ID, motifs_da.sacral$motif_ID))
+compare <- data.frame(motif=all,
+                      tf=motif_ann[match(all, motif_ann$Model),]$Transcription.factor)
+compare$all <- ifelse(compare$motif %in% motifs_da$motif_ID, 1, 0)
+compare$cervical <- ifelse(compare$motif %in% motifs_da.cervical$motif_ID, 1, 0)
+compare$thoracic <- ifelse(compare$motif %in% motifs_da.thoracic$motif_ID, 1, 0)
+compare$lumbar <- ifelse(compare$motif %in% motifs_da.lumbar$motif_ID, 1, 0)
+compare$sacral <- ifelse(compare$motif %in% motifs_da.sacral$motif_ID, 1, 0)
+upset(compare[,4:7])
+```
+
+Although it is complex to directly compare the results from the different enrichment analyses given the differences in power that stem from the large variation in the number of regions used for each test, the difference in the profile of lumbar somites is definitely a salient feature. This is perhaps explained, to some extent, by the observation that many of the lumbar regions occur in promoters and not as many in distal elements, which is in sharp contrast to the rest of the stages.
+
+
+### Transcription factor dynamics
+
+To get an insight into potential key regulators of the different processes happening along development, we next focus on the expression of transcription factors specifically. A large number of TFs are differentially expressed between stages, and we can observe similar dynamics as with the rest of the transcriptome, with different groups of regulators showing maximum expression in particular groups of somites.
+
+```{r tf_expr, fig.width=7, fig.height=5}
+## list of all mouse TFs (1636)
+tfs <- read.table(paste0(dir, "RNA+ATAC/data/Mus_musculus_TF_list.txt"), sep="\t", header = TRUE)
+## restrict to those expressed (1310)
+tfs <- tfs[tfs$Ensembl %in% row.names(geneCounts),]
+## and DE (838; 64% of all expressed)
+tfs <- tfs[tfs$Ensembl %in% row.names(degs),]
+
+## expression
+data <- geneCounts[tfs$Ensembl,-1]
+data <- 2^data-1
+data <- t(apply(data, 1, function(x) (x-mean(x))/sd(x) ))
+
+## split by k means
+set.seed(942)
+clusters.tfs <- kmeans(data, centers=7)
+clusters.tfs <- factor(paste0("cluster", clusters.tfs$cluster), 
+                       levels = paste0("cluster",c(2,4,7,5,3,1,6)))
+names(clusters.tfs) <- row.names(data)
+# table(clusters.tfs)
+
+## order columns based on somite number
+m <- meta.rna
+m$somite <- factor(m$somite, levels=c("SIII","SII","SI"))
+stopifnot(identical(colnames(data), m$sample)) # make sure the metadata corresponds with count data matrix
+order <- order(m$stage, m$somite)
+
+## heatmap annotation
+ha  <- HeatmapAnnotation(df = data.frame(stage = paste0("stage", m[order,]$stage), 
+                                         somite = m[order,]$somite), 
+                         col = list(stage = cols.stage, somite = cols.somite))
+
+Heatmap(data[,order], 
+        cluster_columns = FALSE, 
+        col=colorRamp2(breaks = c(-4,-2,0,2,3), 
+                       colors = c("steelblue4","steelblue","white","indianred3","indianred4")),
+        name = "z-score", 
+        show_row_names = FALSE, 
+        show_column_names = FALSE, 
+        top_annotation = ha, 
+        row_split = clusters.tfs,
+        cluster_row_slices = FALSE)
+```
+
+When looking at the families of TFs represented in each cluster it stands out that `cluster3` almost exclusively contains TFs from the C2H2 zinc finger family; although this is the most abundant TF family in the mammalian genome and is thus represented in all clusters, the number of these TFs in `cluster3` is much higher than in all other expression patterns.
+
+```{r families, fig.width=10, fig.height=7}
+tfs$cluster <- clusters.tfs[match(tfs$Ensembl, names(clusters.tfs))]
+
+par(mfrow=c(3,3))
+for(i in 1:7){
+  plot(table(tfs[which(tfs$cluster == paste0("cluster",i)),]$Family),
+       ylab = "number of TFs", main = paste0("cluster",i), las=2, cex=0.75)
+}
+```
+
+We can also observe that some TF families are predominantly found in a particular cluster. These might be important in regulating some of the processes observed at the corresponding stages. For example, GATA factors are involved in blood development and we see them expressed in lumbar somites, consistent with the wider enrichment results seen above.
+
+```{r fig.width=8, fig.height=4}
+tmp <- tfs[tfs$Family %in% names(table(tfs$Family)[table(tfs$Family) > 5]),]
+Heatmap(prop.table(table(tmp$cluster, tmp$Family),2),
+        col = brewer.pal(n=9, "Greys"),
+        cluster_rows = FALSE)
+```
+
+
+
+```{r save}
+## save results
+write.table(degs, paste0(dir, "RNA+ATAC/results/02_DEgenes_summary_stage_fate.tsv"), 
+            quote = FALSE, sep = "\t")
+write.table(GO.all, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DEGs_stages.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(GO.cervical, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DEGs_stages_cervical.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(GO.thoracic, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DEGs_stages_thoracic.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(GO.lumbar, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DEGs_stages_lumbar.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(GO.sacral, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DEGs_stages_sacral.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(tfs, paste0(dir, "RNA+ATAC/results/02_DE_TFs_clusters.tsv"), 
+            quote = FALSE, sep = "\t", row.names = FALSE)
+
+write.table(dars, paste0(dir, "RNA+ATAC/results/02_DAregions_summary_stage_fate.tsv"), 
+            quote = FALSE, sep = "\t")
+write.table(go.dars, paste0(dir, "RNA+ATAC/results/02_GOenrichment_DARs_stages.tsv"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+saveRDS(pheno.dars, paste0(dir, "RNA+ATAC/results/02_mousePhenotype_enrichment_DARs_stages.Rds"))
+saveRDS(pheno.dars.cervical, paste0(dir, "RNA+ATAC/results/02_mousePhenotype_enrichment_DARs_stages_cervical.Rds"))
+saveRDS(pheno.dars.thoracic, paste0(dir, "RNA+ATAC/results/02_mousePhenotype_enrichment_DARs_stages_thoracic.Rds"))
+saveRDS(pheno.dars.lumbar, paste0(dir, "RNA+ATAC/results/02_mousePhenotype_enrichment_DARs_stages_lumbar.Rds"))
+saveRDS(pheno.dars.sacral, paste0(dir, "RNA+ATAC/results/02_mousePhenotype_enrichment_DARs_stages_sacral.Rds"))
+```
+
+
+
+```{r info}
+sessionInfo()
+```
+
