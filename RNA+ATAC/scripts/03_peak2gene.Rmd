@@ -1,0 +1,479 @@
+---
+title: "Regulatory control of somitogenesis"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SummarizedExperiment)
+library(GenomicInteractions)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(ggrastr)
+library(GGally)
+library(BuenColors)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(networkD3)
+library(topGO)
+library(pcaExplorer)
+library(dynamicTreeCut)
+
+dir <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/"
+source(paste0(dir, "RNA+ATAC/scripts/DORCs_local.R"))
+source(paste0(dir, "RNA+ATAC/scripts/FigR_local.R"))
+
+th <- theme_bw() + 
+  theme(axis.text.x = element_text(size=10), 
+        axis.title.x = element_text(size=12), 
+        axis.text.y = element_text(size=10), 
+        axis.title.y = element_text(size=12), 
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        panel.border = element_blank(), 
+        plot.title = element_text(face="bold", hjust = 0.5, size=12))
+
+cols.stage <- c("darkolivegreen4", "skyblue", "cornflowerblue", 
+                "dodgerblue4", "darkorange", "indianred1")
+names(cols.stage) <- paste0("stage", c(8,18,21,25,27,35))
+cols.somite <- alpha(rep("orchid4",3),c(0.25, 0.5, 0.75))
+names(cols.somite) <- paste0("S", c("I","II","III"))
+```
+
+Having matched RNA and ATAC-seq profiles provides an opportunity to characterise the regulatory mechanisms that control somitogenesis.
+
+```{r load_data}
+## expression data
+meta.rna <- read.table(paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), 
+                       stringsAsFactors = FALSE, header = TRUE)
+meta.rna <- meta.rna[meta.rna$QC == 1 & meta.rna$wrongStage == 0,]
+meta.rna$stage <- paste0("stage", meta.rna$stage)
+meta.rna$somite <- factor(meta.rna$somite, levels=c("SIII","SII","SI"))
+
+data.rna <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_batchCorrected_14PCs.tsv"),
+                       check.names = FALSE)
+data.rna <- data.rna[,c('gene', meta.rna$sample)]
+universe <- data.rna$gene
+names(universe) <- row.names(data.rna)
+
+## accessibility data
+meta.atac <- read.table(paste0(dir, "ATAC-seq/data/metadata_ATACseq_GQ.tsv"), 
+                   stringsAsFactors = FALSE, header = TRUE)
+meta.atac <- meta.atac[meta.atac$QCpass==1,]
+meta.atac$stage <- paste0("stage", meta.atac$stage)
+meta.atac$somite <- factor(meta.atac$somite, levels=c("SIII","SII","SI"))
+
+data.atac <- readRDS(paste0(dir, "ATAC-seq/results/04_peakCounts_csawMerged.NORM.batchCorrected_18PCs.Rds"))
+```
+
+### Peak to gene linking
+
+One way to do this is to identify chromatin loci in the vicinity of DE genes that show coordinated activity patterns; these loci can be postulated as putative regulatory elements driving the changes in gene expression. We can exploit the variation across development, which usually involves large changes in activity, to find gene-peak pairs using correlation analysis. To determine whether a given correlation score is significantly larger than expected by chance, we compare correlation values of the same gene against peaks that are in other chromosomes, which do not contribute to *cis* regulatory mechanisms. 
+
+For this analysis, we use the method implemented in `FigR` (with minor modifications), which uses `chromVAR` to determine a set of background peaks matched for accessibility and GC content to model the null distribution of correlation scores for each gene-peak pair. Naturally, the analysis is restricted to the 43 samples where we generated good-quality libraries for both the RNA and ATAC datasets. We look for correlated peaks within 100kb of a DE gene.
+
+```{r peak2gene, warning=FALSE, message=FALSE, include=FALSE}
+## used matched samples
+samples <- intersect(meta.rna$sample, meta.atac$sample)
+
+## analyse DE genes only
+degs.somite <- read.table(paste0(dir, "RNA+ATAC/results/01_DEresults_summary_somiteTrios_withClusters.tsv"))
+degs.stage <- read.table(paste0(dir, "RNA+ATAC/results/02_DEgenes_summary_stage_fate.tsv"))
+degs <- union(row.names(degs.somite), row.names(degs.stage))
+data.rna <- data.rna[degs,]
+
+# for genes with two ensembl IDs, keep the most abundant one
+data.rna <- data.rna[-which(duplicated(data.rna$gene)),]
+rownames(data.rna) <- data.rna$gene
+# turns out Pgm1 and Pgm2 are both synonyms of each other, one in chr4 and the other in chr5
+# Ensembl annotation names Pgm1 what the annotation used by FigR names Pgm2
+# since FigR uses gene names and not IDs to determine the peaks around the gene, this leads to wrong links
+# remove to avoid conflicts
+data.rna <- data.rna[-which(row.names(data.rna)=="Pgm1"),]
+data.rna <- data.rna[-which(row.names(data.rna)=="Pgm2"),]
+# restrict to shared samples
+data.rna <- as.matrix(2^data.rna[,samples])
+
+## ATAC data should be a summarised experiment object
+tmp <- row.names(data.atac)
+chr <- unlist(lapply(strsplit(tmp, ":"), '[[', 1))
+tmp <- unlist(lapply(strsplit(tmp, ":"), '[[', 2))
+peaks <- GRanges(seqnames = chr,
+                 ranges = IRanges(start = as.numeric(unlist(lapply(strsplit(tmp, "-"), '[[', 1))),
+                                  end = as.numeric(unlist(lapply(strsplit(tmp, "-"), '[[', 2)))))
+data.atac <- 2^data.atac[,samples]
+atac <- SummarizedExperiment(assays = list(counts = data.atac),
+                             colData = meta.atac[meta.atac$sample %in% samples,],
+                             rowRanges = peaks)
+
+## use FigR to compute the correlations between genes and peaks, and test against background (matched) peaks
+cisCor <- runGenePeakcorr(ATAC.se = atac,
+                          RNAmat = data.rna,
+                          normalizeATACmat = FALSE,
+                          genome = "mm10",
+                          windowPadSize = 100000,
+                          nCores = 4,
+                          keepPosCorOnly = FALSE,
+                          keepMultiMappingPeaks = TRUE,
+                          p.cut = NULL,
+                          seed = 123)
+links <- cisCor[which(cisCor$pvalZ<0.05),]
+```
+
+There are `r nrow(links)` gene-peak pairs that are significantly correlated. These involve nearly 6K DE genes, linked to ~13.5K peaks.
+
+```{r linked_features_n}
+c(n_genes = length(unique(links$Gene)),
+  n_peaks = length(unique(links$PeakRanges)))
+```
+
+Most gene-peak pairs show moderate correlation values (median=`r median(links$rObs)`). However, a few pairs with very low correlation coefficients are deemed significant by the method. These correspond to cases where gene expression and accessibility are not associated (correlation values close to 0) but the set of background peaks used to compute significance are biased towards negative correlations. This leads to a significant p-value even if the correlation of the pair in question is not significant itself.
+
+```{r links_corr, fig.width=3, fig.height=3}
+ggplot(links, aes(1, rObs)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  xlab("") +
+  ylab("Spearman correlation") +
+  th + theme(axis.text.x = element_blank(),
+             axis.ticks.x = element_blank())
+```
+
+Thus, to consider a gene-peak pair as significantly correlated we require a minimum correlation coefficient of 0.3 on top of a significant p-value, taking the number of links to 12.8K.
+
+```{r filter_low_corr}
+links <- links[links$rObs>0.3,]
+nrow(links)
+```
+
+Although most genes are linked to a single or a few peaks, a small proportion are connected to more than 5 peaks (`r length(table(links$Gene)[table(links$Gene)>5])` genes). In contrast, the vast majority of peaks (`r round(prop.table(table(table(links$PeakRanges)))*100, 2)[1]`%) regulate a single gene.
+
+```{r links_per_feature, fig.width=10, fig.height=5}
+par(mfrow=c(1,2))
+plot(table(table(links$Gene)), bty="l",
+     xlab="number of peaks per gene",
+     ylab="number of genes")
+plot(table(table(links$PeakRanges)), bty="l",
+     xlab="number of genes per peak",
+     ylab="number of peaks")
+
+# summary(as.numeric(table(links$Gene)))
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 1.00    1.00    2.00    2.452   3.000  30.000  
+# summary(as.numeric(table(links$PeakRanges)))
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 1.000   1.000   1.000   1.147   1.000   8.000 
+```
+
+The set of defined pairs involve around half of all the DE genes, for both those that are differential across somite trios, and across stages. 
+
+```{r links_differential}
+## check how many of the correlated regions are differential
+dars.somite <- read.table(paste0(dir, "RNA+ATAC/results/01_DAregions_summary_somiteTrios_withClusters.tsv"))
+dars.stage <- read.table(paste0(dir, "RNA+ATAC/results/02_DAregions_summary_stage_fate.tsv"))
+dars <- union(row.names(dars.somite), row.names(dars.stage))
+
+links$DE <- ifelse(links$Gene %in% degs.somite$gene & links$Gene %in% degs.stage$gene, "both",
+                   ifelse(links$Gene %in% degs.somite$gene, "somite",
+                          ifelse(links$Gene %in% degs.stage$gene, "stage", "nonDE")))
+links$DE_stage <- degs.stage[match(links$Gene, degs.stage$gene),]$fate 
+# the same proportion of DE genes in each fate are linked
+
+links$DA <- ifelse(links$PeakRanges %in% row.names(dars.somite) & links$PeakRanges %in% row.names(dars.stage), "both",
+                   ifelse(links$PeakRanges %in% row.names(dars.somite), "somite",
+                          ifelse(links$PeakRanges %in% row.names(dars.stage), "stage", "nonDA")))
+links$DA_stage <- dars.stage[match(links$PeakRanges, row.names(dars.stage)),]$fate 
+
+df <- data.frame(n_DE_linked = c(length(unique(links[links$DE %in% c("both", "somite"),]$Gene)),
+                                 length(unique(links[links$DE %in% c("both", "stage"),]$Gene))),
+                 DE_pct = c(round(length(unique(links[links$DE %in% c("both", "somite"),]$Gene))/nrow(degs.somite)*100,2),
+                            round(length(unique(links[links$DE %in% c("both", "stage"),]$Gene))/nrow(degs.stage)*100,2)),
+                 n_DA_linked = c(length(unique(links[links$DA %in% c("both", "somite"),]$PeakRanges)),
+                                 length(unique(links[links$DA %in% c("both", "stage"),]$PeakRanges))),
+                 DA_pct = c(round(length(unique(links[links$DA %in% c("both", "somite"),]$PeakRanges))/nrow(dars.somite)*100,2),
+                            round(length(unique(links[links$DA %in% c("both", "stage"),]$PeakRanges))/nrow(dars.stage)*100,2)))
+row.names(df) <- c("somite", "stage")
+df
+```
+
+Although some peaks are nearby their putative target, the majority are dozens of kilobases away.
+
+```{r links_distance, fig.width=10, fig.height=4}
+## TSS coordinates
+TSSg <- FigR::mm10TSSRanges
+
+# distance between gene and peak
+tmp <- unlist(lapply(strsplit(links$PeakRanges, ":"), '[[', 2))
+links.gr <- GenomicInteractions(GRanges(seqnames = unlist(lapply(strsplit(links$PeakRanges, ":"), '[[', 1)),
+                                        IRanges(start = as.numeric(unlist(lapply(strsplit(tmp, "-"), '[[', 1))),
+                                                end = as.numeric(unlist(lapply(strsplit(tmp, "-"), '[[', 2))))),
+                                TSSg[match(links$Gene, TSSg$gene_name),])
+distance <- distance(anchorOne(links.gr), anchorTwo(links.gr))
+links$distance <- distance
+
+bins <- data.frame(distance=c('0-200','200-2e3','2e3-5e3','5e3-10e3','10e3-50e3','50e3-100e3'),
+                   n=c(sum(distance <= 200),
+                       sum(distance > 200 & distance <= 2e3),
+                       sum(distance > 2e3 & distance <= 5e3),
+                       sum(distance > 5e3 & distance <= 10e3),
+                       sum(distance > 10e3 & distance <= 50e3),
+                       sum(distance > 50e3 & distance <= 100e3)))
+bins$n_pct <- round(bins$n/length(distance)*100,2)
+bins
+```
+
+The median distance between linked peaks and genes is of `r median(distance)/1e3`kb.
+
+Supporting the regulatory potential of the linked peaks, a larger proportion overlap ENCODE cCREs characterised as enhancers (H3K27ac-high, H3K4me3-low) compared to all peaks detected in somites, and all peaks within 100kb of a DE gene. Furthermore, the overlap greatly increases if we restrict to links with the strongest correlations.
+
+```{r encode, fig.width=5, fig.height=3}
+encode <- read.table(paste0(dir, "ATAC-seq/results/05_peaks_overlapExternalData.tsv"), sep="\t")
+row.names(encode) <- paste0("chr", row.names(encode))
+
+encode$encode <- ifelse(encode$pELS | encode$dELS, "enhancer",
+                        ifelse(encode$PLS, "promoter",
+                               ifelse(encode$CTCF_bound, "CTCFonly",
+                                      ifelse(encode$H3K4me3, "H3K4me3only", "not_in_encode"))))
+links$encode <- encode[match(links$PeakRanges, row.names(encode)),]$encode
+links$fantom <- encode[match(links$PeakRanges, row.names(encode)),]$FANTOM
+links$vista <- encode[match(links$PeakRanges, row.names(encode)),]$VISTA
+
+links$encode <- as.factor(links$encode)
+
+# round(rbind(all_peaks = prop.table(table(encode$encode)[1:4])*100,
+#             peaks_proximal_to_DEGs = prop.table(table(encode[unique(cisCor$PeakRanges),]$encode)[1:4])*100,
+#             peaks_linked_to_DEGs = prop.table(table(links$encode)[1:4])*100,
+#             linked_0.5 = prop.table(table(links[links$rObs>0.5,]$encode)[1:4])*100,
+#             linked_0.65 = prop.table(table(links[links$rObs>0.65,]$encode)[1:4])*100), 2)[,c(4,2,1,3)]
+
+df <- data.frame(type = rep(c("enhancer", "not_in_encode"), each=7),
+                 prop = c(sum(encode$encode=="enhancer")/nrow(encode)*100,
+                          sum(encode[unique(cisCor$PeakRanges),]$encode=="enhancer")/nrow(encode[unique(cisCor$PeakRanges),])*100,
+                          sum(links[links$rObs>0.3,]$encode=="enhancer")/nrow(links[links$rObs>0.3,])*100,
+                          sum(links[links$rObs>0.4,]$encode=="enhancer")/nrow(links[links$rObs>0.4,])*100,
+                          sum(links[links$rObs>0.5,]$encode=="enhancer")/nrow(links[links$rObs>0.5,])*100,
+                          sum(links[links$rObs>0.6,]$encode=="enhancer")/nrow(links[links$rObs>0.6,])*100,
+                          sum(links[links$rObs>0.7,]$encode=="enhancer")/nrow(links[links$rObs>0.7,])*100,
+                          sum(encode$encode=="not_in_encode")/nrow(encode)*100,
+                          sum(encode[unique(cisCor$PeakRanges),]$encode=="not_in_encode")/nrow(encode[unique(cisCor$PeakRanges),])*100,
+                          sum(links[links$rObs>0.3,]$encode=="not_in_encode")/nrow(links[links$rObs>0.3,])*100,
+                          sum(links[links$rObs>0.4,]$encode=="not_in_encode")/nrow(links[links$rObs>0.4,])*100,
+                          sum(links[links$rObs>0.5,]$encode=="not_in_encode")/nrow(links[links$rObs>0.5,])*100,
+                          sum(links[links$rObs>0.6,]$encode=="not_in_encode")/nrow(links[links$rObs>0.6,])*100,
+                          sum(links[links$rObs>0.7,]$encode=="not_in_encode")/nrow(links[links$rObs>0.7,])*100))
+
+ggplot(df, aes(rep(1:7,2), prop, colour=type)) +
+  geom_point(size=2) +
+  geom_line() +
+  xlab("") +
+  ylab("% of peaks") +
+  ylim(c(0,100)) +
+  scale_x_continuous(breaks=1:7,
+                     labels=c("all peaks", "peaks near DEGs", paste0("linked peaks > 0.", 3:7))) +
+  th + theme(axis.text.x = element_text(angle=45, hjust=1),
+             panel.grid.major.y = element_line(size=0.5, colour="grey90"),
+             panel.grid.minor.y = element_line(size=0.25, colour="grey95"))
+```
+
+Similarly, while only ~10% of all peaks overlap with FANTOM5 enhancers, the number increases to 14% for linked peaks and this goes up as the correlation threshold becomes more stringent.
+
+```{r fantom, fig.width=5, fig.height=3}
+df <- data.frame(type = "in_FANTOM",
+                 prop = c(sum(encode$FANTOM)/nrow(encode)*100,
+                          sum(encode[unique(cisCor$PeakRanges),]$FANTOM)/nrow(encode[unique(cisCor$PeakRanges),])*100,
+                          sum(links[links$rObs>0.3,]$fantom)/nrow(links[links$rObs>0.3,])*100,
+                          sum(links[links$rObs>0.4,]$fantom)/nrow(links[links$rObs>0.4,])*100,
+                          sum(links[links$rObs>0.5,]$fantom)/nrow(links[links$rObs>0.5,])*100,
+                          sum(links[links$rObs>0.6,]$fantom)/nrow(links[links$rObs>0.6,])*100,
+                          sum(links[links$rObs>0.7,]$fantom)/nrow(links[links$rObs>0.7,])*100))
+
+ggplot(df, aes(1:7, prop, colour=type)) +
+  geom_point(size=2) +
+  geom_line() +
+  xlab("") +
+  ylab("% of peaks") +
+  ylim(c(0,100)) +
+  scale_x_continuous(breaks=1:7,
+                     labels=c("all peaks", "peaks near DEGs", paste0("linked peaks > 0.", 3:7))) +
+  th + theme(axis.text.x = element_text(angle=45, hjust=1),
+             panel.grid.major.y = element_line(size=0.5, colour="grey90"),
+             panel.grid.minor.y = element_line(size=0.25, colour="grey95"))
+```
+
+### Highly-regulated genes
+
+As mentioned above, although most genes are linked only to a single or few peaks, a few hundred have many more connections. The authors of `FigR` coined the term [*domains of regulatory chromatin (DORCs)*](https://doi.org/10.1016/j.cell.2020.09.056) to refer to these loci of high interactivity, and showed that they "are enriched for lineage-determining genes and overlap with known super-enhancers". In our case, many of the genes linked to dozens of peaks correspond to late Hox genes, which is expected since it has been shown that Hox expression regulation relies on coordinated chromatin remodeling. Many other genes are identified as well. 
+
+```{r dorcs, fig.width=8, fig.height=5}
+# Determine DORC genes
+dorcGenes <- dorcJPlot(dorcTab = links,
+                       cutoff = 6,
+                       returnGeneList = TRUE)
+```
+
+This restricted set of genes with a large number of linked peaks are still enriched for key processes relevant for somitogenesis, such as patterning and the development and morphogenesis of the different somite derivative lineages. These data suggest that the expression of genes that are crucial in the development and differentiation of somites are under intricate regulatory control.
+
+```{r go_dorcs, message=FALSE, warning=FALSE}
+go <- topGOtable(DEgenes = dorcGenes,
+                 BGgenes = universe,
+                 topGO_method2 = "elim",
+                 ontology = "BP",
+                 geneID = "symbol",
+                 fullNamesInRows = FALSE,
+                 addGeneToTerms = TRUE,
+                 mapping = "org.Mm.eg.db",
+                 topTablerows = 100)
+go[,c(2,4,7,9)]
+```
+
+Interestingly, while genes most active at different fates are all as likely to be associated to at least one peak, there is a strong depletion of genes expressed in thoracic somites among DORC genes.
+
+```{r dorcs_stage}
+## check proportion per stage
+tmp <- unique(links[,c('Gene','DE_stage')])
+df <- rbind(all_DEGs = prop.table(table(degs.stage$fate))*100,
+            all_linked_DEGs = prop.table(table(tmp$DE_stage))*100,
+            DORC_DEGs  = prop.table(table(tmp[tmp$Gene %in% dorcGenes,]$DE_stage))*100)
+df[,c(1,4,2,3)]
+```
+
+
+### Regulatory control of DORC genes
+
+Next, we can ask whether the peaks linked to the highly-regulated genes are enriched for particular TF binding sites, compared to a set of (matched) background peaks. These TFs have the potential of regulating the expression of the gene in question. This hypothesis becomes stronger if the expression of the TF itself is correlated with the accessibility values of the peaks. `FigR` performs these two calculations, and combines the results into a *regulation score*. Positive/negative scores correspond to activating/repressing interactions.
+
+```{r figr, message=FALSE, warning=FALSE, include=FALSE}
+# Get DORC scores
+dorcMat <- getDORCScores(ATAC.se = atac, 
+                         dorcTab = links, 
+                         geneList = dorcGenes,
+                         normalizeATACmat = FALSE,
+                         nCores = 4)
+fig.d <- runFigRGRN(ATAC.se = atac,
+                    rnaMat = data.rna,
+                    dorcMat = dorcMat,
+                    dorcK = 30,
+                    dorcTab = links,
+                    genome = "mm10",
+                    dorcGenes = dorcGenes,
+                    nCores = 4)
+
+## remove interactions involving TFs that are expressed at very low levels
+means <- rowMeans(data.rna)
+keep <- means[means>2]
+fig.d <- fig.d[fig.d$Motif %in% names(keep),]
+```
+
+We observe a set of DORCs with very strong TFBS enrichment scores, all corresponding to enrichment for *Nr6a1* binding sites; DORCs regulated by *Nr6a1* show negative scores, indicating TF expression is negatively correlated with chromatin accessibility. Other transcription factors result in more modest motif enrichment scores, with both repressing and enhancing activities.
+
+```{r figr_plot, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+ggplot(fig.d, aes(Corr.log10P, Enrichment.log10P, color=Score, shape=as.factor(Motif=="Nr6a1"))) +
+  geom_point_rast(size=0.75) + 
+  scale_color_gradientn(colours = jdb_palette("solar_extra"), 
+                        limits=c(-2,2),
+                        oob = scales::squish,
+                        breaks=scales::breaks_pretty(n=3)) +
+  geom_vline(xintercept = 0, lty=2, colour="grey") +
+  xlab(expression('(signed) -log'[10]*' p-value TF expression - accessibility correlation')) +
+  ylab(expression('-log'[10]*' p-value TF motif enrichment')) +
+  labs(shape = "Nr6a1 enrichment") +
+  th
+```
+
+Across all DORC genes, some TFs consistently show large regulation scores, as shown below, with *Nr6a1* again standing out. Several of the TFs highlighted have been already picked up in previous analyses, given the enrichment of their binding sites in DA peaks.
+
+```{r figr_important_tfs, warning=FALSE, message=FALSE, fig.width=8, fig.height=4}
+rankDrivers(fig.d, rankBy = "meanScore", interactive = FALSE)
+```
+
+Generally, TFs are associated with a handful to a dozen different targets, but some factors show more widespread activity (again, *Nr6a1*, *Ebf1* and *Sox6*, all acting as repressors, and several Hox genes).
+
+```{r figr_num_targets, fig.width=8, fig.height=4}
+rankDrivers(fig.d, score.cut = 1, rankBy = "nTargets", interactive = TRUE)
+```
+
+We can then group DORCs (*rows*) that are regulated in a concerted manner by groups of TFs (*columns*). 
+
+```{r figr_heatmap, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+score.cut <- 1.25
+set.seed(2948)
+regulons <- plotfigRHeatmap(figR.d = fig.d,
+                            score.cut = score.cut,
+                            row_names_gp = gpar(fontsize=8, fontface="italic"),
+                            column_names_gp = gpar(fontsize=10),
+                            show_row_dend = TRUE, k=4)
+regulons <- draw(regulons)
+
+## get cluster membership
+DORCsToKeep <- fig.d %>% dplyr::filter(abs(Score) >= score.cut) %>% pull(DORC) %>% unique()
+TFsToKeep <- fig.d %>% dplyr::filter(abs(Score) >= score.cut) %>% pull(Motif) %>% unique()
+net.d <- fig.d %>% dplyr::filter(DORC %in% DORCsToKeep & Motif %in% TFsToKeep) %>%
+    reshape2::dcast(DORC ~ Motif) %>%
+    tibble::column_to_rownames("DORC") %>% as.matrix()
+
+clusters <- as.data.frame(unlist(row_order(regulons)))
+clusters$cluster <- paste0("cluster", substr(row.names(clusters), 1, 1))
+clusters$gene <- row.names(net.d[clusters[,1],])
+clusters$cluster <- factor(clusters$cluster, levels=paste0("cluster", names(row_order(regulons))))
+```
+
+And visualise the expression of the DORC genes, to link each module to its activity pattern across stages.
+
+```{r figr_expr_heatmap, message=FALSE, warning=FALSE, fig.width=6, fig.height=6}
+data <- data.rna[match(clusters$gene, row.names(data.rna)),]
+data <- t(apply(data, 1, function(x) (x-mean(x))/sd(x) ))
+
+m <- meta.rna[match(colnames(data), meta.rna$sample),]
+m$stage <- factor(m$stage, levels=paste0("stage", c(8,18,21,25,27,35)))
+m$somite <- factor(m$somite, levels=c("SIII","SII","SI"))
+order <- order(m$stage, m$somite)
+
+## heatmap annotation
+ha  <- HeatmapAnnotation(df = data.frame(stage = m[order,]$stage, 
+                                         somite = m[order,]$somite), 
+                         col = list(stage = cols.stage, somite = cols.somite))
+Heatmap(data[,order], 
+        cluster_columns = FALSE, 
+        cluster_rows = FALSE,
+        col=colorRamp2(breaks = c(-4,-2,0,2,3), 
+                       colors = c("steelblue4","steelblue","white", 
+                                  "indianred3","indianred4")),
+        row_names_gp = gpar(fontsize=8, fontface="italic"),
+        column_names_gp = gpar(fontsize=10),
+        name = "z-score", 
+        show_row_names = TRUE, 
+        show_column_names = FALSE, 
+        top_annotation = ha,
+        row_split = clusters$cluster,
+        cluster_row_slices = FALSE)
+```
+Two main modules are evident, with genes expressed either early or late in development. The role of *Nr6a1* is prominent, and Hox genes also show regulatory effects consistent with developmental progression. 
+
+```{r save}
+saveRDS(cisCor, paste0(dir, "RNA+ATAC/results/03_gene_peak_correlations.Rds"))
+write.table(links, paste0(dir, "RNA+ATAC/results/03_gene_peak_links.tsv"), quote = FALSE, sep = "\t", row.names = FALSE)
+saveRDS(fig.d, paste0(dir, "RNA+ATAC/results/03_FigR_network.Rds"))
+saveRDS(net.d, paste0(dir, "RNA+ATAC/results/03_regulationScores_thr1.25.Rds"))
+write.table(clusters, paste0(dir, "RNA+ATAC/results/03_regulons_clusters.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+```
+
+
+```{r}
+sessionInfo()
+```
+
