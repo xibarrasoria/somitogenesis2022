@@ -440,7 +440,7 @@ dars[dars$cluster=="cluster11",]$fate.sub <- NA
 table(dars$fate.sub)[c(1,2,6,3:5)]
 ```
 
-In terms of the location of these DA regions in the genome, they are slightly depleted of promoters, with a corresponding increase in distal and intergenic regions. But the difference is not as striking as observed between the somite trios. However, if we split by their accessibility profile, regions open in thoracic somites show a much more pronounced depletion of promoters and increase of distal elements; whereas regions preferentially open in lumbar somites are enriched in promoter elements.
+In terms of the location of these DA regions in the genome, they are slightly depleted of promoter and exonic peakss, with a corresponding increase in intronic, distal and intergenic regions. But the difference is not striking as observed between the somite trios. However, if we split by their accessibility profile, regions open in thoracic somites show a much more pronounced depletion of promoters and increase of distal elements; whereas regions preferentially open in lumbar somites are enriched in promoter elements.
 
 ```{r genomic_context, fig.width=5, fig.height=4}
 ## annotation of regions based on genomic context
@@ -451,25 +451,26 @@ dars.ann$cluster <- dars$cluster
 dars.ann$fate <- dars$fate
 dars.ann$fate.sub <- dars$fate.sub
 
-df <- data.frame(all = round(colSums(peakAnn[,7:11])/nrow(peakAnn)*100, 2),
-                 DA = round(colSums(dars.ann[,7:11])/nrow(dars.ann)*100, 2),
-                 cervical = colSums(dars.ann[which(dars.ann$fate=="cervical"),7:11])/
+df <- data.frame(all = round(colSums(peakAnn[,7:12])/nrow(peakAnn)*100, 2),
+                 DA = round(colSums(dars.ann[,7:12])/nrow(dars.ann)*100, 2),
+                 cervical = colSums(dars.ann[which(dars.ann$fate=="cervical"),7:12])/
                    length(which(dars.ann$fate=="cervical"))*100,
-                 thoracic = colSums(dars.ann[which(dars.ann$fate=="thoracic"),7:11])/
+                 thoracic = colSums(dars.ann[which(dars.ann$fate=="thoracic"),7:12])/
                    length(which(dars.ann$fate=="thoracic"))*100,
-                 lumbar = colSums(dars.ann[which(dars.ann$fate=="lumbar"),7:11])/
+                 lumbar = colSums(dars.ann[which(dars.ann$fate=="lumbar"),7:12])/
                    length(which(dars.ann$fate=="lumbar"))*100,
-                 sacral = colSums(dars.ann[which(dars.ann$fate=="sacral"),7:11])/
+                 sacral = colSums(dars.ann[which(dars.ann$fate=="sacral"),7:12])/
                    length(which(dars.ann$fate=="sacral"))*100)
 df <- data.frame(class=rep(row.names(df),6),
-                 DA = c(rep(FALSE, 5), rep(TRUE, 25)),
-                 context = c(rep(c("all", "DA", "cervical", "thoracic", "lumbar", "sacral"), each=5)),
+                 DA = c(rep(FALSE, 6), rep(TRUE, 30)),
+                 context = c(rep(c("all", "DA", "cervical", "thoracic", "lumbar", "sacral"), each=6)),
                  prop = c(df$all, df$DA, df$cervical, df$thoracic, df$lumbar, df$sacral))
+df$class <- factor(df$class, levels=c("promoter","exonic","intronic","proximal","distal","intergenic"))
 df$context <- factor(df$context, levels=c("all", "DA", "cervical", "thoracic", "lumbar", "sacral"))
 
 ggplot(df, aes(context, prop, fill=class)) + 
   geom_bar(stat="identity") +
-  scale_fill_manual(values = brewer.pal(n=5, "Spectral")) +
+  scale_fill_manual(values = brewer.pal(n=6, "Spectral")) +
   ylab("proportion of all peaks") +
   th
 ```

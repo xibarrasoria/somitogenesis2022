@@ -1,6 +1,6 @@
 ---
 title: "Somite maturation"
-date: '10 August, 2022'
+date: '12 December, 2022'
 output:
   html_document:
     keep_md: true
@@ -786,38 +786,39 @@ peakAnn <- read.table(paste0(dir, "ATAC-seq/results/05_peaks_classAnnotation.tsv
 
 ## subset to DA regions
 dars.ann <- peakAnn[substr(row.names(dars), 4, 30),]
-rbind(n = colSums(dars.ann[,7:11]),
-      pct = round(colSums(dars.ann[,7:11])/nrow(dars.ann)*100, 2))
+rbind(n = colSums(dars.ann[,7:12]),
+      pct = round(colSums(dars.ann[,7:12])/nrow(dars.ann)*100, 2))
 ```
 
 ```
-##     promoter   genic proximal distal intergenic
-## n     238.00 1358.00   720.00 334.00      51.00
-## pct     8.81   50.28    26.66  12.37       1.89
+##     promoter exonic intronic proximal distal intergenic
+## n     238.00 221.00   1137.0   720.00 334.00      51.00
+## pct     8.81   8.18     42.1    26.66  12.37       1.89
 ```
 
-Compared to the distribution of **all** open chromatin regions, we observe a depletion of promoters, with a corresponding increase of distal and intergenic peaks.
+Compared to the distribution of **all** open chromatin regions, we observe a depletion of promoter and exonic peaks, with a corresponding increase of intronic, distal and intergenic peaks.
 
-
-```r
-t(data.frame(allPeaks.pct=round(colSums(peakAnn[,7:11])/nrow(peakAnn)*100, 2)))
-```
-
-```
-##              promoter genic proximal distal intergenic
-## allPeaks.pct    18.72 49.27    24.13   6.89       0.99
-```
 
 ```r
-df <- data.frame(all = round(colSums(peakAnn[,7:11])/nrow(peakAnn)*100, 2),
-                 DA = round(colSums(dars.ann[,7:11])/nrow(dars.ann)*100, 2))
+t(data.frame(allPeaks.pct=round(colSums(peakAnn[,7:12])/nrow(peakAnn)*100, 2)))
+```
+
+```
+##              promoter exonic intronic proximal distal intergenic
+## allPeaks.pct    18.72  11.89    37.38    24.13   6.89       0.99
+```
+
+```r
+df <- data.frame(all = round(colSums(peakAnn[,7:12])/nrow(peakAnn)*100, 2),
+                 DA = round(colSums(dars.ann[,7:12])/nrow(dars.ann)*100, 2))
 df <- data.frame(class=rep(row.names(df),2),
-                 DA = c(rep(FALSE, 5), rep(TRUE, 5)),
+                 DA = c(rep(FALSE, 6), rep(TRUE, 6)),
                  prop = c(df$all, df$DA))
+df$class <- factor(df$class, levels=c("promoter","exonic","intronic","proximal","distal","intergenic"))
 
 ggplot(df, aes(DA, prop, fill=class)) + 
   geom_bar(stat="identity") +
-  scale_fill_manual(values = brewer.pal(n=5, "Spectral")) +
+  scale_fill_manual(values = brewer.pal(n=6, "Spectral")) +
   ylab("proportion of all peaks") +
   th
 ```
