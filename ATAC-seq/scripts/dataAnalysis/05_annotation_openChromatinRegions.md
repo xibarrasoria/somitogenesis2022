@@ -46,17 +46,18 @@ Thus, we can first separate promoters from everything else, by identifying peaks
 ## we use csaw function detailRanges to annotate the peaks
 ## but we want to use specifically Ensembl's annotation, version 96, to keep compatibility with the RNA-seq results
 ## thus, create a transcriptDB object from Ensembl v96
-mmusculusEnsembl.v96 <- makeTxDbFromBiomart(biomart = "ENSEMBL_MART_ENSEMBL", 
-                                            dataset = "mmusculus_gene_ensembl", 
+mmusculusEnsembl.v96 <- makeTxDbFromBiomart(biomart = "ENSEMBL_MART_ENSEMBL",
+                                            dataset = "mmusculus_gene_ensembl",
                                             host="apr2019.archive.ensembl.org")
-mcols(peaks) <- detailRanges(peaks, 
-                             txdb = mmusculusEnsembl.v96, 
-                             orgdb = org.Mm.eg.db, 
+mcols(peaks) <- detailRanges(peaks,
+                             txdb = mmusculusEnsembl.v96,
+                             orgdb = org.Mm.eg.db,
                              dist = 5000, # flanking distance
                              promoter = c(200, 200),
-                             key.field = "ENSEMBL") 
+                             key.field = "ENSEMBL")
+peaks$promoter <- ifelse(grepl(":P", peaks$overlap), 1, 0)
 
-c(nPeaks = length(peaks[grep(":P", peaks$overlap),]), 
+c(nPeaks = sum(peaks$promoter), 
   pct = round(length(peaks[grep(":P", peaks$overlap),])/length(peaks)*100, 2))
 ```
 
@@ -64,28 +65,6 @@ c(nPeaks = length(peaks[grep(":P", peaks$overlap),]),
 ##   nPeaks      pct 
 ## 32367.00    18.72
 ```
-
-From the remaining peaks, the majority are within gene bodies, and only a fifth are distal to annotated genes. The remaining ~10% are within 5kb of annotated genes.
-
-
-```r
-peaks$promoter <- ifelse(grepl(":P", peaks$overlap), 1, 0)
-distal <- peaks[peaks$overlap == "" & peaks$left=="" & peaks$right == "",]
-
-dist <- distanceToNearest(peaks[peaks$promoter==0,], genes(mmusculusEnsembl.v96))
-
-plot(density(log10(mcols(dist)$distance+1)), 
-     main = "peaks outside promoters",
-     xlab="log10 distance to nearest gene",
-     bty="l")
-text(4.5, 0.35, cex = 0.75,
-     labels = paste0(length(distal), " peaks (", round(length(distal)/length(peaks)*100, 2), "%)"))
-text(1.5, 1.35, cex=0.75,
-     labels = paste0(sum(mcols(dist)$distance==0), " peaks (",
-                     round(sum(mcols(dist)$distance==0)/length(peaks)*100, 2), "%)"))
-```
-
-![](05_annotation_openChromatinRegions_files/figure-html/dist_nearest-1.png)<!-- -->
 
 To better annotate the peaks that do not overlap TSSs we need additional data. We exploit available data from ENCODE3 [https://screen.encodeproject.org/], FANTOM5 [https://fantom.gsc.riken.jp/5/] and the VISTA enhancer browser [https://enhancer.lbl.gov/].
 
@@ -205,27 +184,13 @@ peaks.externalAnn$VISTAsomite <- ifelse(row.names(peaks.externalAnn) %in% peaks_
 Furthermore, 67 of the VISTA enhancers with positive expression have positive signal in the somites; 52 of these overlap 110 ATAC-seq peaks.
 
 
-```r
-tmp <- peaks.externalAnn[peaks.externalAnn$sum>0,9:16]
-tmp$VISTA <- ifelse(tmp$VISTA == "Positive", 1,
-                    ifelse(tmp$VISTA == "Negative", -1, 0))
-tmp <- as.matrix(tmp)
-
-tmp <- tmp[order(tmp[,1], tmp[,2], tmp[,3], tmp[,4], tmp[,5], tmp[,6], tmp[,7], tmp[,8], decreasing = TRUE),]
-
-Heatmap(tmp,
-        cluster_rows = FALSE, 
-        cluster_columns = FALSE, 
-        show_row_names = FALSE,
-        show_heatmap_legend = FALSE)
-```
-
 ### Classification of ATAC-seq peaks {.tabset}
 
 We classify the peaks based on their genomic context:
 
 - Promoter: if the peak is within 200bp of an annotated TSS.
-- Genic: if the peak overlaps an annotated gene, but not the TSS.
+- Exonic: if the peak overlaps an annotated exon.
+- Intronic: if the peak overlaps an annotated intron
 - Proximal: if the peak is within 25kb of an annotated gene.
 - Distal: if the peak is farther than 25kb from an annotated gene, but within 100kb.
 - Intergenic: any other peaks.
@@ -233,6 +198,7 @@ We classify the peaks based on their genomic context:
 Recent studies linking putative enhancers to their target genes have shown that most enhancers regulate genes that are located *close-by*. Gasperini et al. (Cell, 2019) found that the median distance between enhancers and target genes was 24.1kb, and the vast majority of pairs were within 100kb. Thus, peaks that are very far from any genes are less likely to be regulators of gene expression.
 
 Apart from promoters, most peaks fall within genes, mostly in introns. Very few peaks are in gene desserts (*intergenic* class, which doesn't have a gene within 100kb), with the vast majority within 25kb from an annotated gene.
+
 
 
 ```r
@@ -243,10 +209,10 @@ dist <- distanceToNearest(peaks, genes(mmusculusEnsembl.v96))
 peaks.classes <- peaks.externalAnn[,c(1:4,6)]
 peaks.classes$nearest_gene <- mcols(dist)$distance
 
+# precedence: promoter -> exon -> intron
 peaks.classes$promoter <- ifelse(grepl(":P", peaks.classes$overlap), 1, 0)
-peaks.classes$genic <- ifelse(peaks.classes$overlap != "" & 
-                                peaks.classes$promoter == 0, 
-                              1, 0)
+peaks.classes$exonic <- ifelse(peaks.classes$promoter == 0 & grepl(":E", peaks.classes$overlap), 1, 0)
+peaks.classes$intronic <- ifelse(peaks.classes$promoter == 0 & peaks.classes$exonic == 0 & grepl(":I", peaks.classes$overlap), 1, 0)
 peaks.classes$proximal <- ifelse(peaks.classes$overlap == "" & 
                                    peaks.classes$nearest_gene <= 25e3, 
                                  1, 0)
@@ -257,11 +223,11 @@ peaks.classes$intergenic <- ifelse(peaks.classes$nearest_gene > 100e3, 1, 0)
 
 ## for peaks in promoters, recover the gene
 peaks.classes$promoter_gene <- NA
-promoters <- promoters(mmusculusEnsembl.v96, 
+promoters <- promoters(mmusculusEnsembl.v96,
                        upstream = 200, downstream = 200,
                        columns = "GENEID")
 # assign gene name based on ensembl ID
-gene_ann <- read.table(paste0(dir, "RNA-seq/data/Mus_musculus.GRCm38.96.ann"), 
+gene_ann <- read.table(paste0(dir, "RNA-seq/data/Mus_musculus.GRCm38.96.ann"),
                        stringsAsFactors = FALSE, row.names = 1)
 promoters$geneName <- gene_ann[unlist(promoters$GENEID),1]
 tmp <- peaks.classes[peaks.classes$promoter==1,]
@@ -272,14 +238,12 @@ for(i in 1:nrow(tmp)){
       promoters[subjectHits(findOverlaps(peaks[row.names(tmp)[i]], promoters))]$geneName)),
     collapse = ";")
 }
-```
 
-```r
 ## summarise
-df <- data.frame(colSums(peaks.classes[,7:11]))
+df <- data.frame(colSums(peaks.classes[,7:12]))
 colnames(df) <- "count"
 df$class <- row.names(df)
-df$class <- factor(df$class, levels=c("promoter", "genic", "proximal", "distal", "intergenic"))
+df$class <- factor(df$class, levels=c("promoter", "exonic", "intronic", "proximal", "distal", "intergenic"))
 
 ggplot(df, aes(class, count, fill=class)) + 
   geom_bar(stat="identity") +
@@ -298,7 +262,8 @@ df[,c(2,1,3)]
 ```
 ##                 class count   pct
 ## promoter     promoter 32367 18.72
-## genic           genic 85194 49.27
+## exonic         exonic 20556 11.89
+## intronic     intronic 64638 37.38
 ## proximal     proximal 41724 24.13
 ## distal         distal 11912  6.89
 ## intergenic intergenic  1704  0.99
@@ -314,7 +279,7 @@ Not surprisingly, there is very good agreement between our classified promoters 
 
 
 ```r
-cols <- gg_color_hue(n=5)
+cols <- gg_color_hue(n=6)
 
 upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$promoter==1,]),10:16],
                     main.bar.color = cols[1], order.by = "freq", nintersects = 10)
@@ -324,36 +289,64 @@ upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$promoter==1,]),10:
 
 #### Genic peaks
 
-Peaks that overlap genes but not the TSS are instead overlapped by distal enhancer-like elements and a larger proportion of FANTOM enhancers. A much smaller proportion are bound by CTCF, compared to promoter elements.
+Peaks that overlap genes but not the TSS are instead overlapped by distal enhancer-like elements. 
+
+- Exonic peaks overlap more often with proximal cCREs compared to intronic peaks, which are almost always associated to distal cCREs.
+- Exonic peaks are more often bound by CTCF, compared to intronic peaks.
+- Intronic peaks overlap FANTOM enhancers more often than exonic peaks. 
 
 
 ```r
-upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$genic==1,]),10:16],
+print("Exonic")
+```
+
+```
+## [1] "Exonic"
+```
+
+```r
+upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$exonic==1,]),10:16], 
                     main.bar.color = cols[2], order.by = "freq", nintersects = 10)
 ```
 
-![](05_annotation_openChromatinRegions_files/figure-html/genic-1.png)<!-- -->
+![](05_annotation_openChromatinRegions_files/figure-html/exonic-1.png)<!-- -->
+
+
+```r
+print("Intronic")
+```
+
+```
+## [1] "Intronic"
+```
+
+```r
+upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$intronic==1,]),10:16],
+                    main.bar.color = cols[3], order.by = "freq", nintersects = 10)
+```
+
+![](05_annotation_openChromatinRegions_files/figure-html/intronic-1.png)<!-- -->
 
 #### Proximal peaks
 
-For peaks that do not overlap genes but are within 25kb, again we see a large overlap with ENCODE's dELS elements, and many are also identified in the FANTOM5 data.
+For peaks that do not overlap genes but are within 25kb we see a large overlap with ENCODE's dELS elements, and many are also identified in the FANTOM5 data.
 
 
 ```r
 upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$proximal==1,]),10:16],
-                    main.bar.color = cols[3], order.by = "freq", nintersects = 10)
+                    main.bar.color = cols[4], order.by = "freq", nintersects = 10)
 ```
 
 ![](05_annotation_openChromatinRegions_files/figure-html/proximal-1.png)<!-- -->
 
 ####  Distal peaks
 
-A similar picture is observed for distal peaks, which are those that are farther from genes, but within 100kb.
+A similar picture is observed for distal peaks, which are those that are even farther from genes, but within 100kb.
 
 
 ```r
 upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$distal==1,]),10:16],
-                    main.bar.color = cols[4], order.by = "freq", nintersects = 10)
+                    main.bar.color = cols[5], order.by = "freq", nintersects = 10)
 ```
 
 ![](05_annotation_openChromatinRegions_files/figure-html/distal-1.png)<!-- -->
@@ -365,12 +358,14 @@ And only a few of the peaks that are away from genes have overlaps with the exte
 
 ```r
 upset(peaks.externalAnn[row.names(peaks.classes[peaks.classes$intergenic==1,]),10:16],
-                    main.bar.color = cols[5], order.by = "freq", nintersects = 10)
+                    main.bar.color = cols[6], order.by = "freq", nintersects = 10)
 ```
 
 ![](05_annotation_openChromatinRegions_files/figure-html/intergenic-1.png)<!-- -->
 
 ###
+
+---
 
 Overall, promoter peaks are very well represented in the external databases, with over 85% annotated in ENCODE3. In contrast, over half of all peaks falling close to genes are not captured in the external catalogues. This is a reflection of the incomplete nature of these compendia, since only a limited set of cell types and tissues has been considered. 
 
@@ -390,35 +385,36 @@ peaks.classes$in_vista <- ifelse(row.names(peaks.classes) %in% vista, 1, 0)
 peaks.classes$CTCF_only <- ifelse(row.names(peaks.classes) %in% ctcf_only, 1, 0)
 
 
-df <- data.frame(promoters = colSums(peaks.classes[peaks.classes$promoter == 1, 13:16]),
-           genic = colSums(peaks.classes[peaks.classes$genic == 1, 13:16]),
-           proximal = colSums(peaks.classes[peaks.classes$proximal == 1, 13:16]),
-           distal = colSums(peaks.classes[peaks.classes$distal == 1, 13:16]),
-           intergenic = colSums(peaks.classes[peaks.classes$intergenic == 1, 13:16]))
+df <- data.frame(promoters = colSums(peaks.classes[peaks.classes$promoter == 1, 14:17]),
+                 exonic = colSums(peaks.classes[peaks.classes$exonic == 1, 14:17]),
+                 intronic = colSums(peaks.classes[peaks.classes$intronic == 1, 14:17]),
+                 proximal = colSums(peaks.classes[peaks.classes$proximal == 1, 14:17]),
+                 distal = colSums(peaks.classes[peaks.classes$distal == 1, 14:17]),
+                 intergenic = colSums(peaks.classes[peaks.classes$intergenic == 1, 14:17]))
 
 df
 ```
 
 ```
-##           promoters genic proximal distal intergenic
-## in_encode     28050 37432    17336   4057        425
-## in_fantom      3341  8271     5370    933         55
-## in_vista        184  1345      778    261         48
-## CTCF_only       658  6538     4538   1074        102
+##           promoters exonic intronic proximal distal intergenic
+## in_encode     28050   8874    28558    17336   4057        425
+## in_fantom      3341   1058     7213     5370    933         55
+## in_vista        184    168     1177      778    261         48
+## CTCF_only       658   2014     4524     4538   1074        102
 ```
 
 ```r
-df2 <- round(t(t(df)/colSums(peaks.classes[,7:11]))*100,2)
+df2 <- round(t(t(df)/colSums(peaks.classes[,7:12]))*100,2)
 colnames(df2) <- paste0(colnames(df2), "%")
 df2
 ```
 
 ```
-##           promoters% genic% proximal% distal% intergenic%
-## in_encode      86.66  43.94     41.55   34.06       24.94
-## in_fantom      10.32   9.71     12.87    7.83        3.23
-## in_vista        0.57   1.58      1.86    2.19        2.82
-## CTCF_only       2.03   7.67     10.88    9.02        5.99
+##           promoters% exonic% intronic% proximal% distal% intergenic%
+## in_encode      86.66   43.17     44.18     41.55   34.06       24.94
+## in_fantom      10.32    5.15     11.16     12.87    7.83        3.23
+## in_vista        0.57    0.82      1.82      1.86    2.19        2.82
+## CTCF_only       2.03    9.80      7.00     10.88    9.02        5.99
 ```
 
 Nonetheless, putative enhancer elements with available experimental data supporting their role as enhancers will be very useful. 
