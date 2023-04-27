@@ -103,7 +103,7 @@ shinyUI(fluidPage(
                        ),
                      fluidRow(
                        radioButtons("colour", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'somite')
                        )
         ),
@@ -168,7 +168,7 @@ shinyUI(fluidPage(
                        ),
                      fluidRow(
                        radioButtons("colourATAC", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'somite')
                        )
                ),
@@ -201,7 +201,7 @@ shinyUI(fluidPage(
                      ),
                      fluidRow(
                        radioButtons("colourTF", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'somite')
                      )
         ),
@@ -250,7 +250,7 @@ shinyUI(fluidPage(
                      ),
                      fluidRow(
                        radioButtons("colourTrios", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'somite')
                      )
         ),
@@ -316,7 +316,7 @@ shinyUI(fluidPage(
                      ),
                      fluidRow(
                        radioButtons("colourStages", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'stage')
                      )
         ),
@@ -366,7 +366,7 @@ shinyUI(fluidPage(
         sidebarPanel(width=2,
                      fluidRow(
                        radioButtons("colourLinks", "colour by:", 
-                                    choices = list("stage"='stage', "somite"='somite'),
+                                    choices = list("somite"='somite', "stage"='stage'),
                                     selected = 'stage')
                      )
         ),
