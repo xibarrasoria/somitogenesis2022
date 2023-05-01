@@ -19,7 +19,7 @@ library(colorspace)
 library(inlmisc)
 
 dir <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/"
-out <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/Figures/plot_test/"
+out <- "/Users/ibarra01/OneDrive - CRUK Cambridge Institute/github/somitogenesis2020/Figures/plots/"
 
 palette(brewer.pal(n=12, "Set3")[-c(1:2)])
 
@@ -753,8 +753,8 @@ keep <- iSEE::subsetPointsByGrid(fig.d$Corr.log10P, fig.d$Enrichment.log10P, res
 tmp <- fig.d[keep,]
 pdf(paste0(out, "Figure4C_regulation_scores.pdf"), useDingbats = FALSE, width = 8, height = 4.5)
 ggplot(tmp, aes(Corr.log10P, Enrichment.log10P, fill=Score)) +
-  geom_point_rast(data = tmp[tmp$Motif == "Nr6a1" & tmp$Enrichment.log10P>0,], size=2.5, pch=24, colour="grey30") +
-  geom_point_rast(data = tmp[tmp$Motif != "Nr6a1",], size=1.5, pch=21, colour=rgb(1,1,1,0)) +
+  geom_point(data = tmp[tmp$Motif == "Nr6a1" & tmp$Enrichment.log10P>0,], size=2, pch=24, colour="grey30") +
+  geom_point(data = tmp[tmp$Motif != "Nr6a1",], size=1.5, pch=21, colour=rgb(1,1,1,0)) +
   scale_fill_gradientn(colours = diverge_hcl(n=7, palette = "Tropic"),
                         limits=c(-2,2),
                         oob = scales::squish,
@@ -921,10 +921,10 @@ dev.off()
 
 # Figure S1 ###############
 
-## Left-right DE analysis ======
+## A: Left-right DE analysis ======
 res <- read.table(paste0(dir, "RNA-seq/results/00_DEresults_side_allSomites.tsv"))
 
-pdf(paste0(out, "FigureS1.pdf"), useDingbats = FALSE, width = 5, height = 5)
+pdf(paste0(out, "FigureS1A.pdf"), useDingbats = FALSE, width = 5, height = 5)
 ggplot(res, aes(logCPM, logFC, colour=FDR < 0.05)) +
   geom_point() +
   scale_color_manual(values = c("black", "indianred")) +
@@ -934,10 +934,7 @@ ggplot(res, aes(logCPM, logFC, colour=FDR < 0.05)) +
   th + theme(legend.position = "none")
 dev.off()
 
-
-# Figure S2 ###############
-
-## A: PCA normalised data ======
+## B: PCA normalised data ======
 data <- read.table(paste0(dir, "RNA-seq/data/geneCounts.RAW.tsv"), check.names = FALSE)
 dataNorm <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_logCPM.tsv"), check.names = FALSE)
 meta <- read.table(paste0(dir, "RNA-seq/data/metadata_RNAseq.tsv"), stringsAsFactors = FALSE, header = TRUE)
@@ -970,11 +967,11 @@ plots[[2]] <- ggplot(df, aes(PC1, PC2, colour=date)) +
   ggtitle("date") + 
   th + theme(legend.position = "bottom")
 
-pdf(paste0(out, "FigureS2A.pdf"), useDingbats = FALSE, width = 9, height = 5)
+pdf(paste0(out, "FigureS1B.pdf"), useDingbats = FALSE, width = 9, height = 5)
 ggarrange(plotlist = plots, ncol=2)
 dev.off()
 
-## B: PCA batch-corrected data ======
+## C: PCA batch-corrected data ======
 dataNorm.corr <- read.table(paste0(dir, "RNA-seq/data/geneCounts.NORM_batchCorrected_14PCs.tsv"), check.names = FALSE)
 pcs <- read.table(paste0(dir, "RNA-seq/results/02_pcs_residuals.tab"))
 
@@ -1005,12 +1002,12 @@ plots[[2]] <- ggplot(df, aes(PC1, PC2, colour=date)) +
   ggtitle("date") + 
   th + theme(legend.position = "bottom")
 
-pdf(paste0(out, "FigureS2B.pdf"), useDingbats = FALSE, width = 9, height = 5)
+pdf(paste0(out, "FigureS1C.pdf"), useDingbats = FALSE, width = 9, height = 5)
 ggarrange(plotlist = plots, ncol=2)
 dev.off()
 
 
-# Figure S3 ###############
+# Figure S2 ###############
 cols <- GetColors(34)[c(25,24,15:13)]
 
 ## A: insert size distribution ======
@@ -1019,7 +1016,7 @@ samples <- c("e23_SII-2.noDUPs.GQ.bam", "e16_SI-2.noDUPs.GQ.bam",
              "e26_SII-2.noDUPs.GQ.bam", "e2_SII-2.noDUPs.GQ.bam",
              "e13_SIII-2.noDUPs.GQ.bam")
 
-pdf(paste0(out, "FigureS3A.pdf"), useDingbats = FALSE, width = 12, height = 3)
+pdf(paste0(out, "FigureS2A.pdf"), useDingbats = FALSE, width = 12, height = 3)
 par(mfrow=c(1,5))
 for(i in 1:length(samples)){
   tmp <- diagnostics[[samples[i]]]
@@ -1036,7 +1033,7 @@ tss <- readRDS(paste0(dir, "ATAC-seq/results/02_TSSinsertionCounts.Rds"))
 tss.norm <- t(do.call("cbind", lapply(tss, function(x) colMeans(x)/mean(colMeans(x[,c(1:100,1901:2001)])))))
 
 samples <- gsub(".noDUPs.GQ.bam", "", samples)
-pdf(paste0(out, "FigureS3B.pdf"), useDingbats = FALSE, width = 12, height = 3)
+pdf(paste0(out, "FigureS2B.pdf"), useDingbats = FALSE, width = 12, height = 3)
 par(mfrow=c(1,5))
 for(i in 1:length(samples)){
   plot(rollmean(tss.norm[samples[i],], k=25), type="l", lwd=5, 
@@ -1050,7 +1047,7 @@ dev.off()
 ## C: number of peaks ======
 meta.atac.all <- read.table(paste0(dir, "ATAC-seq/data/metadata_ATACseq.tsv"), stringsAsFactors = FALSE, header = TRUE)
 
-pdf(paste0(out, "FigureS3C.pdf"), useDingbats = FALSE, width = 4, height = 4)
+pdf(paste0(out, "FigureS2C.pdf"), useDingbats = FALSE, width = 4, height = 4)
 ggplot(meta.atac.all, aes(as.factor(insSizeDist), nPeaks/1e3)) +
   geom_violin() +
   geom_jitter(width=0.1, colour="grey40") +
@@ -1064,7 +1061,7 @@ ggplot(meta.atac.all, aes(as.factor(insSizeDist), nPeaks/1e3)) +
 dev.off()
 
 ## D: FRiP ======
-pdf(paste0(out, "FigureS3D.pdf"), useDingbats = FALSE, width = 4, height = 4)
+pdf(paste0(out, "FigureS2D.pdf"), useDingbats = FALSE, width = 4, height = 4)
 ggplot(meta.atac.all, aes(as.factor(insSizeDist), readsInPeaks/goodQuality*100)) +
   geom_violin() +
   geom_jitter(width=0.1, colour="grey40") +
@@ -1084,7 +1081,7 @@ qc <- data.frame(nuclosome = ifelse(as.numeric(meta.atac.all$insSizeDist)>=2, 1,
                  tss = ifelse(meta.atac.all$TSSscore > 4, 1, 0))
 row.names(qc) <- meta.atac.all$sample
 
-pdf(paste0(out, "FigureS3E.pdf"), useDingbats = FALSE, width = 4, height = 4)
+pdf(paste0(out, "FigureS2E.pdf"), useDingbats = FALSE, width = 4, height = 4)
 upset(qc, mainbar.y.label = "number of samples", sets.x.label = "number of samples\nthat pass", text.scale=1.25)
 dev.off()
 
@@ -1099,7 +1096,7 @@ ggplot(meta.atac.all, aes(as.factor(insSizeDist), size/1e3, fill=as.factor(insSi
 dev.off()
 
 ## G: Seq depth ======
-pdf(paste0(out, "FigureS3G.pdf"), useDingbats = FALSE, width = 4, height = 4)
+pdf(paste0(out, "FigureS2G.pdf"), useDingbats = FALSE, width = 4, height = 4)
 ggplot(meta.atac.all, aes(as.factor(insSizeDist), librarySize/1e6, fill=as.factor(insSizeDist))) +
   geom_boxplot() +
   scale_fill_manual(values = cols) +
@@ -1110,13 +1107,13 @@ dev.off()
 
 
 
-# Figure S4 ###############
+# Figure S3 ###############
 
 ## A: MA plot background ======
 background <- readRDS(paste0(dir, "ATAC-seq/results/03_backgroundCounts_10kbBins.Rds"))
 adj.counts <- cpm(asDGEList(background), log=TRUE)
 
-pdf(paste0(out, "FigureS4A.pdf"), useDingbats = FALSE, width = 8, height = 4)
+pdf(paste0(out, "FigureS3A.pdf"), useDingbats = FALSE, width = 8, height = 4)
 par(mfrow=c(1, 2))
 for (i in c(11,40)){
   cur.x <- adj.counts[,1]
@@ -1143,7 +1140,7 @@ adjc <- log2(assay(filtered.data)+0.5)
 filtered.data <- normFactors(filtered.data, se.out = TRUE)
 re.adjc <- cpm(asDGEList(filtered.data), log=TRUE)
 
-pdf(paste0(out, "FigureS4B.pdf"), useDingbats = FALSE, width = 8, height = 8)
+pdf(paste0(out, "FigureS3B.pdf"), useDingbats = FALSE, width = 8, height = 8)
 par(mfrow=c(2,2))
 for(i in c(11,40)){
   mval <- adjc[,1]-adjc[,i]
@@ -1170,7 +1167,7 @@ dev.off()
 ## C: trended norm ======
 re.adjc <- adjc - assay(filtered.data, "offset")/log(2)
 
-pdf(paste0(out, "FigureS4C.pdf"), useDingbats = FALSE, width = 8, height = 4)
+pdf(paste0(out, "FigureS3C.pdf"), useDingbats = FALSE, width = 8, height = 4)
 par(mfrow=c(1,2))
 for(i in c(11,40)){
   mval <- re.adjc[,1]-re.adjc[,i]
@@ -1194,7 +1191,7 @@ tmp <- re.adjc[order(vars, decreasing=TRUE)[1:5000],]
 pca <- prcomp(t(tmp))
 df <- cbind(pca$x, meta.atac)
 
-pdf(paste0(out, "FigureS4D.pdf"), useDingbats = FALSE, width = 8, height = 5)
+pdf(paste0(out, "FigureS3D.pdf"), useDingbats = FALSE, width = 8, height = 5)
 plots <- list()
 plots[[1]] <- ggplot(df, aes(PC1, PC2, color=stage)) + 
   geom_point() + 
@@ -1215,7 +1212,7 @@ plots[[2]] <- ggplot(df, aes(PC1, PC2, colour=readsInPeakSet/goodQuality*100)) +
 ggarrange(plotlist = plots, align = "hv")
 dev.off()
 
-## D: Batch correction ======
+## E: Batch correction ======
 pcs <- read.table(paste0(dir, "ATAC-seq/results/03_pcs_residuals.tab"))
 
 # regress out technical noise
@@ -1232,7 +1229,7 @@ tmp <- norm.counts.corr.pca[order(vars, decreasing=TRUE)[1:5000],]
 pca <- prcomp(t(tmp))
 df <- cbind(pca$x, meta.atac)
 
-pdf(paste0(out, "FigureS4E.pdf"), useDingbats = FALSE, width = 8, height = 5)
+pdf(paste0(out, "FigureS3E.pdf"), useDingbats = FALSE, width = 8, height = 5)
 plots <- list()
 plots[[1]] <- ggplot(df, aes(PC1, PC2, color=stage)) + 
   geom_point() + 
@@ -1255,7 +1252,7 @@ dev.off()
 
 
 
-# Figure S5 ###############
+# Figure S4 ###############
 
 ## A: DA accessibility patterns ======
 peakCounts <- readRDS(paste0(dir, "ATAC-seq/results/04_peakCounts_csawMerged.NORM.batchCorrected_18PCs.Rds"))
@@ -1280,7 +1277,7 @@ fates <- c("cervical", rep("thoracic",3), "lumbar", "sacral")
 names(fates) <- paste0("stage",c(8,18,21,25,27,35))
 fates <- factor(fates[meta.atac[order,]$stage], levels=c("cervical", "thoracic", "lumbar", "sacral"))
 
-pdf(paste0(out, "FigureS5A.pdf"), useDingbats = FALSE, width = 6, height = 8)
+pdf(paste0(out, "FigureS4A.pdf"), useDingbats = FALSE, width = 6, height = 8)
 draw(Heatmap(data[,order], 
              cluster_columns = FALSE, 
              col=colorRamp2(breaks = c(-2,0,2,4), 
@@ -1313,7 +1310,7 @@ df <- data.frame(class=rep(row.names(df),2),
                  prop = c(df$all, df$DA))
 df$class <- factor(df$class, levels=rev(c("promoter", "exonic", "intronic", "proximal", "distal", "intergenic")))
 
-pdf(paste0(out, "FigureS5B.pdf"), useDingbats = FALSE, width = 3, height = 5)
+pdf(paste0(out, "FigureS4B.pdf"), useDingbats = FALSE, width = 3, height = 5)
 ggplot(df, aes(DA, prop, fill=class, label=round(prop))) + 
   geom_bar(stat="identity", colour="black", width=0.5) +
   scale_fill_manual(values = c(brewer.pal(n=11, "PiYG")[7:10], "gold2", "darkgoldenrod2")) +
@@ -1327,7 +1324,7 @@ df <- as.data.frame(colData(dev))
 i <- grep("Myf5", row.names(dev))
 df$z <- assay(dev, 'z')[i,]
 
-pdf(paste0(out, "FigureS5C.pdf"), useDingbats = FALSE, width = 3, height = 4)
+pdf(paste0(out, "FigureS4C.pdf"), useDingbats = FALSE, width = 3, height = 4)
 ggplot(df, aes(stage, z, fill=stage)) +
   geom_boxplot(alpha=0.75) +
   scale_fill_manual(values = cols.stage) +
@@ -1344,7 +1341,7 @@ dev.off()
 df <- meta.rna
 df$expr <- as.numeric(geneCounts[geneCounts$gene=="Sox9",-1])
 
-pdf(paste0(out, "FigureS5D.pdf"), useDingbats = FALSE, width = 3, height = 4)
+pdf(paste0(out, "FigureS4D.pdf"), useDingbats = FALSE, width = 3, height = 4)
 ggplot(df, aes(stage, expr, fill=stage)) +
   geom_boxplot(alpha=0.75) +
   scale_fill_manual(values = cols.stage) +
